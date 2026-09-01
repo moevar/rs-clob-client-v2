@@ -20,6 +20,7 @@ pub use types::response::{
 pub use types::stream::{MarketStreamContinuity, MarketStreamEvent, MarketStreamTerminal};
 
 pub use crate::ws::{
-    ConnectionDiagnostic, ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic,
-    ParserFailureClassification, WsError,
+    ApplicationMessageDirection, ApplicationMessageFormat, ConnectionDiagnostic,
+    ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic, ParserFailureClassification,
+    RawConnectionEvent, WsError,
 };

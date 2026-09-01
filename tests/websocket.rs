@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use polymarket_client_sdk_v2::clob::ws::{Client, WsMessage};
+use polymarket_client_sdk_v2::clob::ws::{
+    ApplicationMessageDirection, ApplicationMessageFormat, Client, ConnectionDiagnosticKind,
+    RawConnectionEvent, WsMessage,
+};
 use polymarket_client_sdk_v2::types::{Address, U256, b256};
 use polymarket_client_sdk_v2::ws::config::Config;
 use serde_json::json;
@@ -25,7 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 struct MockWsServer {
     addr: SocketAddr,
     /// Broadcast messages to ALL connected clients
-    message_tx: broadcast::Sender<String>,
+    message_tx: broadcast::Sender<Message>,
     /// Receives subscription requests from clients
     subscription_rx: mpsc::UnboundedReceiver<String>,
 }
@@ -37,7 +40,7 @@ impl MockWsServer {
         let addr = listener.local_addr().unwrap();
 
         // Broadcast channel for sending to ALL clients
-        let (message_tx, _) = broadcast::channel::<String>(4096);
+        let (message_tx, _) = broadcast::channel::<Message>(4096);
         let (subscription_tx, subscription_rx) = mpsc::unbounded_channel::<String>();
 
         let broadcast_tx = message_tx.clone();
@@ -73,8 +76,8 @@ impl MockWsServer {
                             // Handle outgoing messages to client
                             msg = msg_rx.recv() => {
                                 match msg {
-                                    Ok(text) => {
-                                        if write.send(Message::Text(text.into())).await.is_err() {
+                                    Ok(message) => {
+                                        if write.send(message).await.is_err() {
                                             break;
                                         }
                                     }
@@ -100,7 +103,15 @@ impl MockWsServer {
 
     /// Send a message to all connected clients.
     fn send(&self, message: &str) {
-        drop(self.message_tx.send(message.to_owned()));
+        drop(
+            self.message_tx
+                .send(Message::Text(message.to_owned().into())),
+        );
+    }
+
+    /// Send a binary message to all connected clients.
+    fn send_binary(&self, payload: Vec<u8>) {
+        drop(self.message_tx.send(Message::Binary(payload.into())));
     }
 
     /// Receive the next subscription request.
@@ -1852,6 +1863,17 @@ mod observable_market_stream {
         }
     }
 
+    async fn next_raw_event<S>(stream: &mut Pin<Box<S>>) -> RawConnectionEvent
+    where
+        S: Stream<Item = SdkResult<RawConnectionEvent>> + ?Sized,
+    {
+        timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("raw stream should yield before timeout")
+            .expect("raw stream should not close")
+            .expect("raw stream event should be ok")
+    }
+
     #[tokio::test]
     async fn ordered_stream_emits_all_market_event_types_in_source_order() {
         let mut server = MockWsServer::start().await;
@@ -1955,6 +1977,61 @@ mod observable_market_stream {
         assert!(second_generation > first_generation);
         assert!(matches!(second_message, WsMessage::PriceChange(_)));
         client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_stream_yields_new_generation_boundary_before_resubscription() {
+        let mut server = ReconnectableMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, short_reconnect_config()).unwrap();
+
+        let stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut stream = Box::pin(stream);
+        let initial_sub = server.recv_subscription().await.unwrap();
+        assert!(initial_sub.contains(&payloads::asset_id().to_string()));
+
+        let first_generation = loop {
+            if let RawConnectionEvent::ApplicationMessage {
+                generation,
+                direction: ApplicationMessageDirection::Outbound,
+                ..
+            } = next_raw_event(&mut stream).await
+            {
+                break generation;
+            }
+        };
+
+        server.disconnect_all();
+        let resub = server.recv_subscription().await.unwrap();
+        assert!(resub.contains(&payloads::asset_id().to_string()));
+
+        let mut boundary_generation = None;
+        loop {
+            match next_raw_event(&mut stream).await {
+                RawConnectionEvent::Diagnostic { diagnostic, .. }
+                    if diagnostic.kind == ConnectionDiagnosticKind::Connected
+                        && diagnostic.generation > first_generation =>
+                {
+                    boundary_generation = Some(diagnostic.generation);
+                }
+                RawConnectionEvent::ApplicationMessage {
+                    generation,
+                    direction: ApplicationMessageDirection::Outbound,
+                    payload,
+                    ..
+                } if generation > first_generation => {
+                    assert_eq!(Some(generation), boundary_generation);
+                    assert_eq!(payload, resub.as_bytes());
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        client.close().await.unwrap();
+        server.disconnect_all();
     }
 
     #[tokio::test]
@@ -2478,6 +2555,102 @@ mod observable_market_stream {
             alive_tasks_after_shutdown <= baseline_alive_tasks,
             "shutdown must join SDK-owned tasks; baseline alive tasks: {baseline_alive_tasks}, after shutdown: {alive_tasks_after_shutdown}"
         );
+    }
+}
+
+mod raw_market_stream {
+    use std::pin::Pin;
+
+    use futures_util::Stream;
+    use polymarket_client_sdk_v2::Result as SdkResult;
+
+    use super::*;
+
+    async fn next_raw_event<S>(stream: &mut Pin<Box<S>>) -> RawConnectionEvent
+    where
+        S: Stream<Item = SdkResult<RawConnectionEvent>> + ?Sized,
+    {
+        timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("raw stream should yield before timeout")
+            .expect("raw stream should not close")
+            .expect("raw stream event should be ok")
+    }
+
+    #[tokio::test]
+    async fn raw_stream_preserves_outbound_text_malformed_text_binary_and_grouping() {
+        let mut server = MockWsServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut stream = Box::pin(stream);
+        let subscription = server.recv_subscription().await.unwrap();
+
+        let first = next_raw_event(&mut stream).await;
+        let generation = match first {
+            RawConnectionEvent::Diagnostic { diagnostic, .. } => {
+                assert_eq!(diagnostic.kind, ConnectionDiagnosticKind::Connected);
+                diagnostic.generation
+            }
+            other => panic!("generation boundary must precede raw data: {other:?}"),
+        };
+        assert!(generation.as_u64() > 0);
+
+        let outbound = next_raw_event(&mut stream).await;
+        match outbound {
+            RawConnectionEvent::ApplicationMessage {
+                generation: event_generation,
+                direction,
+                format,
+                payload,
+                ..
+            } => {
+                assert_eq!(event_generation, generation);
+                assert_eq!(direction, ApplicationMessageDirection::Outbound);
+                assert_eq!(format, ApplicationMessageFormat::Text);
+                assert_eq!(payload, subscription.as_bytes());
+            }
+            other => panic!("expected outbound subscription payload, got {other:?}"),
+        }
+
+        let malformed = format!(
+            r#"{{"event_type":"book","asset_id":"{}""#,
+            payloads::ASSET_ID_STR
+        );
+        let binary = vec![0, 1, 2, 0xff];
+        let book = payloads::book().to_string();
+        server.send(&malformed);
+        server.send_binary(binary.clone());
+        server.send(&book);
+
+        let mut inbound = Vec::new();
+        while inbound.len() < 3 {
+            let event = next_raw_event(&mut stream).await;
+            if let RawConnectionEvent::ApplicationMessage {
+                generation: event_generation,
+                direction: ApplicationMessageDirection::Inbound,
+                format,
+                payload,
+                ..
+            } = event
+            {
+                assert_eq!(event_generation, generation);
+                inbound.push((format, payload));
+            }
+        }
+
+        assert_eq!(
+            inbound,
+            vec![
+                (ApplicationMessageFormat::Text, malformed.into_bytes()),
+                (ApplicationMessageFormat::Binary, binary),
+                (ApplicationMessageFormat::Text, book.into_bytes()),
+            ]
+        );
+        client.close().await.unwrap();
     }
 }
 

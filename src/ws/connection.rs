@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use backoff::backoff::Backoff as _;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -31,6 +32,9 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// Broadcast capacity for the opt-in raw application-frame tap.
+const RAW_BROADCAST_CAPACITY: usize = 8192;
 
 /// Connection state tracking.
 #[non_exhaustive]
@@ -101,6 +105,96 @@ pub enum ConnectionEvent<M> {
     Message(ConnectionEnvelope<M>),
     /// A connection lifecycle or parser diagnostic.
     Diagnostic(ConnectionDiagnostic),
+}
+
+/// Direction of an application WebSocket message.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationMessageDirection {
+    /// A message received from the remote peer.
+    Inbound,
+    /// A message successfully written to the remote peer.
+    Outbound,
+}
+
+/// Wire representation of an application WebSocket message.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationMessageFormat {
+    /// UTF-8 WebSocket text message.
+    Text,
+    /// WebSocket binary message.
+    Binary,
+}
+
+/// Ordered, pre-parser evidence exposed by the opt-in raw connection tap.
+///
+/// Heartbeat PING/PONG traffic is intentionally excluded. Application messages are emitted as
+/// exact payload bytes. Inbound messages are emitted before parsing, so malformed and unknown
+/// frames remain observable.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum RawConnectionEvent {
+    /// An inbound or successfully written outbound application message.
+    ApplicationMessage {
+        /// Immutable connection generation for this message.
+        generation: ConnectionGeneration,
+        /// Time observed at the transport boundary.
+        observed_at: DateTime<Utc>,
+        /// Message direction.
+        direction: ApplicationMessageDirection,
+        /// WebSocket message representation.
+        format: ApplicationMessageFormat,
+        /// Exact application payload bytes.
+        payload: Vec<u8>,
+    },
+    /// A connection lifecycle or parser boundary in the same ordered stream.
+    Diagnostic {
+        /// Time the diagnostic was emitted.
+        observed_at: DateTime<Utc>,
+        /// Existing typed connection diagnostic.
+        diagnostic: ConnectionDiagnostic,
+    },
+    /// The raw-stream consumer fell behind the SDK broadcast buffer.
+    ReceiverLagged {
+        /// Time the lag was observed by the consumer.
+        observed_at: DateTime<Utc>,
+        /// Current connection generation.
+        generation: ConnectionGeneration,
+        /// Number of raw events missed.
+        missed: u64,
+    },
+    /// The SDK raw-event broadcast channel closed.
+    ReceiverClosed {
+        /// Time closure was observed by the consumer.
+        observed_at: DateTime<Utc>,
+        /// Last known connection generation.
+        generation: ConnectionGeneration,
+    },
+}
+
+impl RawConnectionEvent {
+    /// Return the connection generation attached to this event.
+    #[must_use]
+    pub const fn generation(&self) -> ConnectionGeneration {
+        match self {
+            Self::ApplicationMessage { generation, .. }
+            | Self::ReceiverLagged { generation, .. }
+            | Self::ReceiverClosed { generation, .. } => *generation,
+            Self::Diagnostic { diagnostic, .. } => diagnostic.generation,
+        }
+    }
+
+    /// Return the transport-boundary observation time.
+    #[must_use]
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::ApplicationMessage { observed_at, .. }
+            | Self::Diagnostic { observed_at, .. }
+            | Self::ReceiverLagged { observed_at, .. }
+            | Self::ReceiverClosed { observed_at, .. } => *observed_at,
+        }
+    }
 }
 
 /// Low-level connection lifecycle or continuity diagnostic.
@@ -195,6 +289,8 @@ where
     diagnostic_tx: broadcast::Sender<ConnectionDiagnostic>,
     /// Broadcast sender for ordered messages and diagnostics
     event_tx: broadcast::Sender<ConnectionEvent<M>>,
+    /// Broadcast sender for ordered raw application messages and diagnostics
+    raw_event_tx: broadcast::Sender<RawConnectionEvent>,
     /// Watch sender for current generation
     generation_tx: watch::Sender<ConnectionGeneration>,
     /// Watch receiver for current generation
@@ -226,6 +322,7 @@ where
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (diagnostic_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (raw_event_tx, _) = broadcast::channel(RAW_BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
         let (generation_tx, generation_rx) = watch::channel(ConnectionGeneration::zero());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -238,6 +335,7 @@ where
         let broadcast_tx_clone = broadcast_tx.clone();
         let diagnostic_tx_clone = diagnostic_tx.clone();
         let event_tx_clone = event_tx.clone();
+        let raw_event_tx_clone = raw_event_tx.clone();
         let state_tx_clone = state_tx.clone();
         let generation_tx_clone = generation_tx.clone();
         let shutdown_clone = Arc::clone(&shutdown);
@@ -250,6 +348,7 @@ where
                 broadcast_tx_clone,
                 diagnostic_tx_clone,
                 event_tx_clone,
+                raw_event_tx_clone,
                 parser,
                 state_tx_clone,
                 generation_tx_clone,
@@ -267,6 +366,7 @@ where
             broadcast_tx,
             diagnostic_tx,
             event_tx,
+            raw_event_tx,
             generation_tx,
             generation_rx,
             shutdown_tx,
@@ -289,6 +389,7 @@ where
         broadcast_tx: broadcast::Sender<ConnectionEnvelope<M>>,
         diagnostic_tx: broadcast::Sender<ConnectionDiagnostic>,
         event_tx: broadcast::Sender<ConnectionEvent<M>>,
+        raw_event_tx: broadcast::Sender<RawConnectionEvent>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
         generation_tx: watch::Sender<ConnectionGeneration>,
@@ -309,6 +410,7 @@ where
                 Self::emit_diagnostic(
                     &diagnostic_tx,
                     &event_tx,
+                    &raw_event_tx,
                     ConnectionDiagnostic {
                         generation,
                         kind: ConnectionDiagnosticKind::Shutdown,
@@ -325,7 +427,7 @@ where
             let connect_result = tokio::select! {
                 () = wait_for_shutdown(&mut shutdown_rx) => {
                     _ = state_tx.send(ConnectionState::Disconnected);
-                    Self::emit_diagnostic(&diagnostic_tx, &event_tx, ConnectionDiagnostic {
+                    Self::emit_diagnostic(&diagnostic_tx, &event_tx, &raw_event_tx, ConnectionDiagnostic {
                         generation,
                         kind: ConnectionDiagnosticKind::Shutdown,
                     });
@@ -346,6 +448,7 @@ where
                     Self::emit_diagnostic(
                         &diagnostic_tx,
                         &event_tx,
+                        &raw_event_tx,
                         ConnectionDiagnostic {
                             generation,
                             kind: ConnectionDiagnosticKind::Connected,
@@ -359,6 +462,7 @@ where
                         &broadcast_tx,
                         &diagnostic_tx,
                         &event_tx,
+                        &raw_event_tx,
                         state_rx,
                         shutdown_rx.clone(),
                         config.clone(),
@@ -387,6 +491,7 @@ where
                     Self::emit_diagnostic(
                         &diagnostic_tx,
                         &event_tx,
+                        &raw_event_tx,
                         ConnectionDiagnostic {
                             generation,
                             kind: ConnectionDiagnosticKind::ConnectTimeout {
@@ -413,6 +518,7 @@ where
                 Self::emit_diagnostic(
                     &diagnostic_tx,
                     &event_tx,
+                    &raw_event_tx,
                     ConnectionDiagnostic {
                         generation,
                         kind: ConnectionDiagnosticKind::ReconnectExhausted { attempts: attempt },
@@ -429,7 +535,7 @@ where
                     () = sleep(duration) => {}
                     () = wait_for_shutdown(&mut shutdown_rx) => {
                         _ = state_tx.send(ConnectionState::Disconnected);
-                        Self::emit_diagnostic(&diagnostic_tx, &event_tx, ConnectionDiagnostic {
+                        Self::emit_diagnostic(&diagnostic_tx, &event_tx, &raw_event_tx, ConnectionDiagnostic {
                             generation,
                             kind: ConnectionDiagnosticKind::Shutdown,
                         });
@@ -454,6 +560,7 @@ where
         broadcast_tx: &broadcast::Sender<ConnectionEnvelope<M>>,
         diagnostic_tx: &broadcast::Sender<ConnectionDiagnostic>,
         event_tx: &broadcast::Sender<ConnectionEvent<M>>,
+        raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
         state_rx: watch::Receiver<ConnectionState>,
         shutdown_rx: watch::Receiver<bool>,
         config: Config,
@@ -495,6 +602,13 @@ where
                             _ = pong_tx.send(Instant::now());
                         }
                         Ok(Message::Text(text)) => {
+                            Self::emit_raw_application_message(
+                                raw_event_tx,
+                                generation,
+                                ApplicationMessageDirection::Inbound,
+                                ApplicationMessageFormat::Text,
+                                text.as_bytes().to_vec(),
+                            );
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
 
@@ -506,6 +620,7 @@ where
                                             Self::emit_parser_diagnostic(
                                                 diagnostic_tx,
                                                 event_tx,
+                                                raw_event_tx,
                                                 generation,
                                                 diagnostic,
                                             );
@@ -525,6 +640,7 @@ where
                                                     Self::emit_parser_diagnostic(
                                                         diagnostic_tx,
                                                         event_tx,
+                                                        raw_event_tx,
                                                         generation,
                                                         diagnostic,
                                                     );
@@ -550,6 +666,7 @@ where
                                     Self::emit_parser_diagnostic(
                                         diagnostic_tx,
                                         event_tx,
+                                        raw_event_tx,
                                         generation,
                                         diagnostic,
                                     );
@@ -560,8 +677,17 @@ where
                                 }
                             }
                         }
+                        Ok(Message::Binary(payload)) => {
+                            Self::emit_raw_application_message(
+                                raw_event_tx,
+                                generation,
+                                ApplicationMessageDirection::Inbound,
+                                ApplicationMessageFormat::Binary,
+                                payload.to_vec(),
+                            );
+                        }
                         Ok(Message::Close(_)) => {
-                            Self::emit_diagnostic(diagnostic_tx, event_tx, ConnectionDiagnostic {
+                            Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                                 generation,
                                 kind: ConnectionDiagnosticKind::ConnectionClosed,
                             });
@@ -571,7 +697,7 @@ where
                             ))
                         }
                         Err(e) => {
-                            Self::emit_diagnostic(diagnostic_tx, event_tx, ConnectionDiagnostic {
+                            Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                                 generation,
                                 kind: ConnectionDiagnosticKind::ConnectionError,
                             });
@@ -588,8 +714,9 @@ where
 
                 // Handle outgoing messages from subscriptions
                 Some(text) = sender_rx.recv() => {
+                    let payload = text.as_bytes().to_vec();
                     if write.send(Message::Text(text.into())).await.is_err() {
-                        Self::emit_diagnostic(diagnostic_tx, event_tx, ConnectionDiagnostic {
+                        Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                             generation,
                             kind: ConnectionDiagnosticKind::WriteFailed,
                         });
@@ -598,12 +725,19 @@ where
                             WsError::ConnectionClosed,
                         ));
                     }
+                    Self::emit_raw_application_message(
+                        raw_event_tx,
+                        generation,
+                        ApplicationMessageDirection::Outbound,
+                        ApplicationMessageFormat::Text,
+                        payload,
+                    );
                 }
 
                 // Handle PING requests from heartbeat loop
                 Some(()) = ping_rx.recv() => {
                     if write.send(Message::Text("PING".into())).await.is_err() {
-                        Self::emit_diagnostic(diagnostic_tx, event_tx, ConnectionDiagnostic {
+                        Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                             generation,
                             kind: ConnectionDiagnosticKind::WriteFailed,
                         });
@@ -615,7 +749,7 @@ where
                 }
 
                 Some(()) = heartbeat_timeout_rx.recv() => {
-                    Self::emit_diagnostic(diagnostic_tx, event_tx, ConnectionDiagnostic {
+                    Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                         generation,
                         kind: ConnectionDiagnosticKind::HeartbeatTimeout {
                             timeout: config.heartbeat_timeout,
@@ -709,6 +843,7 @@ where
     fn emit_parser_diagnostic(
         diagnostic_tx: &broadcast::Sender<ConnectionDiagnostic>,
         event_tx: &broadcast::Sender<ConnectionEvent<M>>,
+        raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
         generation: ConnectionGeneration,
         diagnostic: ParserDiagnostic,
     ) {
@@ -724,6 +859,7 @@ where
         Self::emit_diagnostic(
             diagnostic_tx,
             event_tx,
+            raw_event_tx,
             ConnectionDiagnostic {
                 generation,
                 kind: ConnectionDiagnosticKind::ParserFailure(diagnostic),
@@ -750,10 +886,31 @@ where
     fn emit_diagnostic(
         diagnostic_tx: &broadcast::Sender<ConnectionDiagnostic>,
         event_tx: &broadcast::Sender<ConnectionEvent<M>>,
+        raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
         diagnostic: ConnectionDiagnostic,
     ) {
         _ = diagnostic_tx.send(diagnostic.clone());
-        _ = event_tx.send(ConnectionEvent::Diagnostic(diagnostic));
+        _ = event_tx.send(ConnectionEvent::Diagnostic(diagnostic.clone()));
+        _ = raw_event_tx.send(RawConnectionEvent::Diagnostic {
+            observed_at: Utc::now(),
+            diagnostic,
+        });
+    }
+
+    fn emit_raw_application_message(
+        raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
+        generation: ConnectionGeneration,
+        direction: ApplicationMessageDirection,
+        format: ApplicationMessageFormat,
+        payload: Vec<u8>,
+    ) {
+        _ = raw_event_tx.send(RawConnectionEvent::ApplicationMessage {
+            generation,
+            observed_at: Utc::now(),
+            direction,
+            format,
+            payload,
+        });
     }
 
     fn emit_reconnect_write_unavailable(&self) {
@@ -761,6 +918,7 @@ where
             Self::emit_diagnostic(
                 &self.diagnostic_tx,
                 &self.event_tx,
+                &self.raw_event_tx,
                 ConnectionDiagnostic {
                     generation: self.generation(),
                     kind: ConnectionDiagnosticKind::WriteFailed,
@@ -780,6 +938,7 @@ where
             Self::emit_diagnostic(
                 &self.diagnostic_tx,
                 &self.event_tx,
+                &self.raw_event_tx,
                 ConnectionDiagnostic {
                     generation: self.generation(),
                     kind: ConnectionDiagnosticKind::WriteFailed,
@@ -805,6 +964,7 @@ where
             Self::emit_diagnostic(
                 &self.diagnostic_tx,
                 &self.event_tx,
+                &self.raw_event_tx,
                 ConnectionDiagnostic {
                     generation: self.generation(),
                     kind: ConnectionDiagnosticKind::WriteFailed,
@@ -843,6 +1003,15 @@ where
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<ConnectionEvent<M>> {
         self.event_tx.subscribe()
+    }
+
+    /// Subscribe to pre-parser application messages and connection diagnostics in source order.
+    ///
+    /// The returned receiver is opt-in. If it falls behind, Tokio reports the exact number of
+    /// missed raw events through [`broadcast::error::RecvError::Lagged`].
+    #[must_use]
+    pub fn subscribe_raw_events(&self) -> broadcast::Receiver<RawConnectionEvent> {
+        self.raw_event_tx.subscribe()
     }
 
     /// Get the currently established generation, or zero before the first connection.

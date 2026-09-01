@@ -22,7 +22,9 @@ use crate::auth::Credentials;
 use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::connection::ConnectionState;
-use crate::ws::{ConnectionDiagnosticKind, ConnectionEvent, ConnectionGeneration, WsError};
+use crate::ws::{
+    ConnectionDiagnosticKind, ConnectionEvent, ConnectionGeneration, RawConnectionEvent, WsError,
+};
 
 /// What a subscription is targeting.
 #[non_exhaustive]
@@ -415,6 +417,69 @@ impl SubscriptionManager {
                         yield MarketStreamEvent::Terminal {
                             generation: connection.generation(),
                             reason: MarketStreamTerminal::ChannelClosed,
+                        };
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Subscribe to exact application payloads and connection boundaries for the market channel.
+    ///
+    /// This opt-in stream captures every application frame on the underlying market connection;
+    /// it deliberately does not parse or filter frames by asset ID.
+    pub fn subscribe_market_raw_events(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<RawConnectionEvent>> + use<>> {
+        let connection = self.connection.clone();
+        let mut raw_event_rx = connection.subscribe_raw_events();
+        self.register_market_subscription(asset_ids, true)?;
+
+        Ok(try_stream! {
+            let mut current_generation: Option<ConnectionGeneration> = None;
+
+            loop {
+                match raw_event_rx.recv().await {
+                    Ok(event) => {
+                        let generation = event.generation();
+                        let is_connected = matches!(
+                            &event,
+                            RawConnectionEvent::Diagnostic {
+                                diagnostic,
+                                ..
+                            } if diagnostic.kind == ConnectionDiagnosticKind::Connected
+                        );
+
+                        if generation != ConnectionGeneration::zero()
+                            && current_generation != Some(generation)
+                        {
+                            current_generation = Some(generation);
+                            if !is_connected {
+                                yield RawConnectionEvent::Diagnostic {
+                                    observed_at: event.observed_at(),
+                                    diagnostic: crate::ws::ConnectionDiagnostic {
+                                        generation,
+                                        kind: ConnectionDiagnosticKind::Connected,
+                                    },
+                                };
+                            }
+                        }
+
+                        yield event;
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        yield RawConnectionEvent::ReceiverLagged {
+                            observed_at: chrono::Utc::now(),
+                            generation: connection.generation(),
+                            missed,
+                        };
+                    }
+                    Err(RecvError::Closed) => {
+                        yield RawConnectionEvent::ReceiverClosed {
+                            observed_at: chrono::Utc::now(),
+                            generation: connection.generation(),
                         };
                         break;
                     }

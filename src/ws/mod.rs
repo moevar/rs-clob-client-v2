@@ -25,8 +25,9 @@ pub mod error;
 pub mod traits;
 
 pub use connection::{
-    ConnectionDiagnostic, ConnectionDiagnosticKind, ConnectionEnvelope, ConnectionEvent,
-    ConnectionGeneration, ConnectionManager,
+    ApplicationMessageDirection, ApplicationMessageFormat, ConnectionDiagnostic,
+    ConnectionDiagnosticKind, ConnectionEnvelope, ConnectionEvent, ConnectionGeneration,
+    ConnectionManager, RawConnectionEvent,
 };
 #[expect(
     clippy::module_name_repetitions,

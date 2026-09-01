@@ -19,6 +19,7 @@ use crate::auth::{Credentials, Kind as AuthKind, Normal};
 use crate::error::Error;
 use crate::types::{Address, B256, Decimal, U256};
 use crate::ws::ConnectionManager;
+use crate::ws::RawConnectionEvent;
 use crate::ws::config::Config;
 use crate::ws::connection::ConnectionState;
 
@@ -177,6 +178,20 @@ impl<S: State> Client<S> {
     ) -> Result<impl Stream<Item = Result<MarketStreamEvent>> + use<S>> {
         let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
         resources.subscriptions.subscribe_market_events(asset_ids)
+    }
+
+    /// Subscribes to exact application payloads and connection boundaries for the market channel.
+    ///
+    /// The returned opt-in stream is intended for lossless capture. It emits frames before SDK
+    /// parsing and therefore also preserves malformed, unknown, and binary application messages.
+    pub fn subscribe_market_raw_events(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<RawConnectionEvent>> + use<S>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        resources
+            .subscriptions
+            .subscribe_market_raw_events(asset_ids)
     }
 
     /// Subscribes to real-time last trade price updates for specified assets.
