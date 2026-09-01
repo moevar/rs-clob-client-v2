@@ -12,7 +12,7 @@ use super::types::response::{
     BestBidAsk, BookUpdate, LastTradePrice, MarketResolved, MidpointUpdate, NewMarket,
     OrderMessage, PriceChange, TickSizeChange, TradeMessage, WsMessage,
 };
-use super::types::stream::MarketStreamEvent;
+use super::types::stream::{MarketRawStreamEvent, MarketStreamEvent};
 use crate::Result;
 use crate::auth::state::{Authenticated, State, Unauthenticated};
 use crate::auth::{Credentials, Kind as AuthKind, Normal};
@@ -177,6 +177,21 @@ impl<S: State> Client<S> {
     ) -> Result<impl Stream<Item = Result<MarketStreamEvent>> + use<S>> {
         let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
         resources.subscriptions.subscribe_market_events(asset_ids)
+    }
+
+    /// Subscribes to raw public market-channel frames and lifecycle boundaries.
+    ///
+    /// The returned stream observes the same market channel connection used by typed market
+    /// subscriptions. Inbound frames are surfaced before parser handling; outbound frames are
+    /// surfaced only after the socket write succeeds.
+    pub fn subscribe_market_raw_events(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<MarketRawStreamEvent>> + use<S>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        resources
+            .subscriptions
+            .subscribe_market_raw_events(asset_ids)
     }
 
     /// Subscribes to real-time last trade price updates for specified assets.
@@ -435,6 +450,11 @@ impl<S: State> Client<S> {
 
     /// Unsubscribe from the ordered market event stream for specific assets.
     pub fn unsubscribe_market_events(&self, asset_ids: &[U256]) -> Result<()> {
+        self.unsubscribe_orderbook(asset_ids)
+    }
+
+    /// Unsubscribe from the raw market event stream for specific assets.
+    pub fn unsubscribe_market_raw_events(&self, asset_ids: &[U256]) -> Result<()> {
         self.unsubscribe_orderbook(asset_ids)
     }
 

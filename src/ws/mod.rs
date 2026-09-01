@@ -22,6 +22,7 @@
 pub mod config;
 pub mod connection;
 pub mod error;
+pub mod raw_event;
 pub mod traits;
 
 pub use connection::{
@@ -33,4 +34,5 @@ pub use connection::{
     reason = "WsError includes module name for clarity when used outside this module"
 )]
 pub use error::WsError;
+pub use raw_event::{RawConnectionEvent, RawFrame, RawFrameProtocol};
 pub use traits::*;

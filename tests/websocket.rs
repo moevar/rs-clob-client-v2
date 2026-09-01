@@ -2481,6 +2481,586 @@ mod observable_market_stream {
     }
 }
 
+mod raw_market_stream {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::Stream;
+    use polymarket_client_sdk_v2::Result as SdkResult;
+    use polymarket_client_sdk_v2::clob::ws::{
+        ChannelType, ConnectionGeneration, MarketRawStreamEvent, MarketStreamContinuity,
+        MarketStreamEvent, MarketStreamTerminal, ParserFailureClassification, RawFrameProtocol,
+    };
+
+    use super::*;
+
+    struct RawMockServer {
+        addr: SocketAddr,
+        frame_tx: broadcast::Sender<Message>,
+        subscription_rx: mpsc::UnboundedReceiver<String>,
+        disconnect_tx: broadcast::Sender<()>,
+        connection_closed_rx: mpsc::UnboundedReceiver<()>,
+        connection_count: Arc<AtomicUsize>,
+    }
+
+    impl RawMockServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let (frame_tx, _) = broadcast::channel::<Message>(4096);
+            let (subscription_tx, subscription_rx) = mpsc::unbounded_channel::<String>();
+            let (disconnect_tx, _) = broadcast::channel::<()>(16);
+            let (connection_closed_tx, connection_closed_rx) = mpsc::unbounded_channel::<()>();
+            let connection_count = Arc::new(AtomicUsize::new(0));
+
+            let frame_broadcast = frame_tx.clone();
+            let disconnect_broadcast = disconnect_tx.clone();
+            let connection_counter = Arc::clone(&connection_count);
+
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    connection_counter.fetch_add(1, Ordering::SeqCst);
+
+                    let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await else {
+                        continue;
+                    };
+
+                    let (mut write, mut read) = ws_stream.split();
+                    let sub_tx = subscription_tx.clone();
+                    let mut frame_rx = frame_broadcast.subscribe();
+                    let mut disconnect_rx = disconnect_broadcast.subscribe();
+                    let closed_tx = connection_closed_tx.clone();
+
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                msg = read.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Text(text))) if text != "PING" => {
+                                            drop(sub_tx.send(text.to_string()));
+                                        }
+                                        Some(Ok(_)) => {}
+                                        _ => break,
+                                    }
+                                }
+                                frame = frame_rx.recv() => {
+                                    match frame {
+                                        Ok(frame) => {
+                                            if write.send(frame).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                _ = disconnect_rx.recv() => {
+                                    break;
+                                }
+                            }
+                        }
+                        match closed_tx.send(()) {
+                            Ok(()) | Err(_) => {}
+                        }
+                    });
+                }
+            });
+
+            Self {
+                addr,
+                frame_tx,
+                subscription_rx,
+                disconnect_tx,
+                connection_closed_rx,
+                connection_count,
+            }
+        }
+
+        fn ws_url(&self, path: &str) -> String {
+            format!("ws://{}{}", self.addr, path)
+        }
+
+        fn send_text(&self, text: &str) {
+            drop(self.frame_tx.send(Message::Text(text.to_owned().into())));
+        }
+
+        fn send_binary(&self, bytes: &[u8]) {
+            drop(self.frame_tx.send(Message::Binary(bytes.to_vec().into())));
+        }
+
+        fn disconnect_all(&self) {
+            drop(self.disconnect_tx.send(()));
+        }
+
+        fn connection_count(&self) -> usize {
+            self.connection_count.load(Ordering::SeqCst)
+        }
+
+        async fn recv_subscription(&mut self) -> Option<String> {
+            timeout(Duration::from_secs(2), self.subscription_rx.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+
+        async fn recv_connection_closed(&mut self) -> bool {
+            timeout(Duration::from_secs(2), self.connection_closed_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        }
+    }
+
+    fn short_reconnect_config() -> Config {
+        let mut config = Config::default();
+        config.reconnect.initial_backoff = Duration::from_millis(500);
+        config.reconnect.max_backoff = Duration::from_millis(500);
+        config
+    }
+
+    async fn wait_for_market_reconnecting(client: &Client) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    client.connection_state(ChannelType::Market),
+                    polymarket_client_sdk_v2::ws::connection::ConnectionState::Reconnecting { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("market connection should enter reconnecting state");
+    }
+
+    async fn next_raw_event<S>(stream: &mut Pin<Box<S>>) -> MarketRawStreamEvent
+    where
+        S: Stream<Item = SdkResult<MarketRawStreamEvent>> + ?Sized,
+    {
+        timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("raw market stream should yield before timeout")
+            .expect("raw market stream should not close")
+            .expect("raw market stream event should be ok")
+    }
+
+    async fn next_typed_event<S>(stream: &mut Pin<Box<S>>) -> MarketStreamEvent
+    where
+        S: Stream<Item = SdkResult<MarketStreamEvent>> + ?Sized,
+    {
+        timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("typed market stream should yield before timeout")
+            .expect("typed market stream should not close")
+            .expect("typed market stream event should be ok")
+    }
+
+    async fn next_typed_message<S>(stream: &mut Pin<Box<S>>) -> (ConnectionGeneration, WsMessage)
+    where
+        S: Stream<Item = SdkResult<MarketStreamEvent>> + ?Sized,
+    {
+        loop {
+            if let MarketStreamEvent::Message {
+                generation,
+                message,
+            } = next_typed_event(stream).await
+            {
+                return (generation, message);
+            }
+        }
+    }
+
+    async fn next_inbound_frame<S>(
+        stream: &mut Pin<Box<S>>,
+        expected_protocol: RawFrameProtocol,
+    ) -> (ConnectionGeneration, Vec<u8>)
+    where
+        S: Stream<Item = SdkResult<MarketRawStreamEvent>> + ?Sized,
+    {
+        loop {
+            if let MarketRawStreamEvent::Inbound {
+                generation,
+                protocol,
+                bytes,
+            } = next_raw_event(stream).await
+            {
+                assert_eq!(protocol, expected_protocol);
+                return (generation, bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_001_raw_text_is_exact_before_typed_message() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let typed_stream = client
+            .subscribe_market_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut typed_stream = Box::pin(typed_stream);
+
+        let sub_request = server.recv_subscription().await.unwrap();
+        assert!(sub_request.contains("\"custom_feature_enabled\":true"));
+
+        let payload = payloads::book().to_string();
+        server.send_text(&payload);
+
+        let (raw_generation, raw_bytes) =
+            next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+        assert_eq!(raw_bytes, payload.as_bytes());
+
+        let (typed_generation, message) = next_typed_message(&mut typed_stream).await;
+        assert_eq!(typed_generation, raw_generation);
+        assert!(matches!(message, WsMessage::Book(_)));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_002_binary_frame_is_captured_without_parser_loss() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let bytes = b"\x00raw-binary-market-frame\xff";
+        server.send_binary(bytes);
+
+        let (generation, raw_bytes) =
+            next_inbound_frame(&mut raw_stream, RawFrameProtocol::Binary).await;
+        assert!(generation.as_u64() > 0);
+        assert_eq!(raw_bytes, bytes);
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_003_malformed_frame_keeps_raw_bytes_and_typed_diagnostic() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let typed_stream = client
+            .subscribe_market_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut typed_stream = Box::pin(typed_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let malformed = format!(
+            r#"{{"event_type":"book","asset_id":"{}""#,
+            payloads::ASSET_ID_STR
+        );
+        server.send_text(&malformed);
+
+        let (_, raw_bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+        assert_eq!(raw_bytes, malformed.as_bytes());
+
+        loop {
+            if let MarketStreamEvent::Continuity {
+                reason: MarketStreamContinuity::ParserDiagnostic(diagnostic),
+                ..
+            } = next_typed_event(&mut typed_stream).await
+            {
+                assert_eq!(
+                    diagnostic.classification,
+                    ParserFailureClassification::MalformedJson
+                );
+                assert_eq!(diagnostic.event_type.as_deref(), Some("book"));
+                assert_eq!(diagnostic.frame_len, malformed.len());
+                assert_eq!(diagnostic.digest.len(), 64);
+                break;
+            }
+        }
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_004_unknown_optional_frame_is_raw_and_non_terminal() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let typed_stream = client
+            .subscribe_market_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut typed_stream = Box::pin(typed_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let unknown = json!({
+            "event_type": "future_optional_market_event",
+            "sentinel": "raw-body-is-only-in-raw-stream"
+        })
+        .to_string();
+        server.send_text(&unknown);
+
+        let (_, raw_bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+        assert_eq!(raw_bytes, unknown.as_bytes());
+
+        loop {
+            if let MarketStreamEvent::Continuity {
+                reason: MarketStreamContinuity::ParserDiagnostic(diagnostic),
+                ..
+            } = next_typed_event(&mut typed_stream).await
+            {
+                assert_eq!(
+                    diagnostic.classification,
+                    ParserFailureClassification::UnknownOptionalEvent
+                );
+                assert_eq!(
+                    diagnostic.event_type.as_deref(),
+                    Some("future_optional_market_event")
+                );
+                break;
+            }
+        }
+
+        server.send_text(&payloads::book().to_string());
+        let (_, message) = next_typed_message(&mut typed_stream).await;
+        assert!(matches!(message, WsMessage::Book(_)));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_005_multi_entry_frame_keeps_one_raw_payload_and_typed_order() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let typed_stream = client
+            .subscribe_market_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut typed_stream = Box::pin(typed_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let batch = json!([
+            payloads::book(),
+            payloads::price_change_batch(payloads::asset_id())
+        ])
+        .to_string();
+        server.send_text(&batch);
+
+        let (_, raw_bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+        assert_eq!(raw_bytes, batch.as_bytes());
+
+        let (_, first) = next_typed_message(&mut typed_stream).await;
+        let (_, second) = next_typed_message(&mut typed_stream).await;
+        assert!(matches!(first, WsMessage::Book(_)));
+        assert!(matches!(second, WsMessage::PriceChange(_)));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_006_outbound_subscription_bytes_are_reported_after_write() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+
+        let sub_request = server.recv_subscription().await.unwrap();
+        let outbound = loop {
+            if let MarketRawStreamEvent::Outbound {
+                generation,
+                protocol: RawFrameProtocol::Text,
+                bytes,
+            } = next_raw_event(&mut raw_stream).await
+            {
+                let text = String::from_utf8(bytes).unwrap();
+                if text.contains("\"type\":\"market\"") {
+                    assert!(generation.as_u64() > 0);
+                    break text;
+                }
+            }
+        };
+
+        assert_eq!(outbound, sub_request);
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_007_reconnect_boundary_precedes_later_raw_frame() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, short_reconnect_config()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.send_text(&payloads::book().to_string());
+        let (first_generation, _) =
+            next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+
+        server.disconnect_all();
+        let resub = server.recv_subscription().await.unwrap();
+        assert!(resub.contains(&payloads::asset_id().to_string()));
+
+        server.send_text(&payloads::price_change_batch(payloads::asset_id()).to_string());
+        let mut saw_new_boundary = false;
+        loop {
+            match next_raw_event(&mut raw_stream).await {
+                MarketRawStreamEvent::Continuity {
+                    generation,
+                    reason: MarketStreamContinuity::Connected,
+                } if generation > first_generation => {
+                    saw_new_boundary = true;
+                }
+                MarketRawStreamEvent::Inbound { generation, .. }
+                    if generation > first_generation =>
+                {
+                    assert!(saw_new_boundary);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_008_raw_observer_reuses_market_connection() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let typed_stream = client
+            .subscribe_market_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut typed_stream = Box::pin(typed_stream);
+
+        let _: Option<String> = server.recv_subscription().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.connection_count(), 1);
+
+        server.send_text(&payloads::book().to_string());
+        let (_, raw_bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Text).await;
+        assert!(!raw_bytes.is_empty());
+        let (_, message) = next_typed_message(&mut typed_stream).await;
+        assert!(matches!(message, WsMessage::Book(_)));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_009_raw_stream_reports_consumer_lag() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let payload = payloads::book().to_string();
+        for _ in 0..3000 {
+            server.send_text(&payload);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let missed = loop {
+            if let MarketRawStreamEvent::Continuity {
+                generation,
+                reason: MarketStreamContinuity::Lagged { missed },
+            } = next_raw_event(&mut raw_stream).await
+            {
+                assert!(generation.as_u64() > 0);
+                break missed;
+            }
+        };
+        assert!(missed > 0);
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn t0370a_sdk_010_raw_stream_reports_write_failure_and_shutdown() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, short_reconnect_config()).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.disconnect_all();
+        assert!(server.recv_connection_closed().await);
+        wait_for_market_reconnecting(&client).await;
+
+        let other_asset = payloads::other_asset_id();
+        let _other_raw_stream = client
+            .subscribe_market_raw_events(vec![other_asset])
+            .unwrap();
+
+        loop {
+            match next_raw_event(&mut raw_stream).await {
+                MarketRawStreamEvent::Outbound { bytes, .. }
+                    if String::from_utf8_lossy(&bytes).contains(&other_asset.to_string()) =>
+                {
+                    panic!("unverified outbound bytes must not precede write-failure evidence");
+                }
+                MarketRawStreamEvent::Continuity {
+                    reason: MarketStreamContinuity::WriteFailed,
+                    ..
+                } => break,
+                _ => {}
+            }
+        }
+
+        client.close().await.unwrap();
+        loop {
+            if let MarketRawStreamEvent::Terminal {
+                reason: MarketStreamTerminal::Shutdown,
+                ..
+            } = next_raw_event(&mut raw_stream).await
+            {
+                break;
+            }
+        }
+        assert!(
+            client
+                .subscribe_market_raw_events(vec![payloads::asset_id()])
+                .is_err()
+        );
+    }
+}
+
 mod message_parsing {
     use std::str::FromStr as _;
 
