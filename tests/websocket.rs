@@ -2689,7 +2689,10 @@ mod raw_market_stream {
                 bytes,
             } = next_raw_event(stream).await
             {
-                assert_eq!(protocol, expected_protocol);
+                assert_eq!(
+                    protocol, expected_protocol,
+                    "raw inbound frame protocol changed before delivery"
+                );
                 return (generation, bytes);
             }
         }

@@ -635,16 +635,15 @@ where
                             Kind::WebSocket,
                             WsError::ConnectionClosed,
                         ));
-                    } else {
-                        Self::emit_raw_event(
-                            raw_event_tx,
-                            RawConnectionEvent::Outbound(RawFrame::new(
-                                generation,
-                                RawFrameProtocol::Text,
-                                bytes,
-                            )),
-                        );
                     }
+                    Self::emit_raw_event(
+                        raw_event_tx,
+                        RawConnectionEvent::Outbound(RawFrame::new(
+                            generation,
+                            RawFrameProtocol::Text,
+                            bytes,
+                        )),
+                    );
                 }
 
                 // Handle PING requests from heartbeat loop
@@ -658,16 +657,15 @@ where
                             Kind::WebSocket,
                             WsError::ConnectionClosed,
                         ));
-                    } else {
-                        Self::emit_raw_event(
-                            raw_event_tx,
-                            RawConnectionEvent::Outbound(RawFrame::new(
-                                generation,
-                                RawFrameProtocol::Text,
-                                b"PING".to_vec(),
-                            )),
-                        );
                     }
+                    Self::emit_raw_event(
+                        raw_event_tx,
+                        RawConnectionEvent::Outbound(RawFrame::new(
+                            generation,
+                            RawFrameProtocol::Text,
+                            b"PING".to_vec(),
+                        )),
+                    );
                 }
 
                 Some(()) = heartbeat_timeout_rx.recv() => {

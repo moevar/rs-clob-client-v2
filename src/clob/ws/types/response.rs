@@ -507,7 +507,7 @@ pub fn parse_if_interested_with_diagnostics(
     // Parse JSON once into Value
     let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
-        Err(err) => {
+        Err(_err) => {
             let diagnostic = ParserDiagnostic::new(
                 ParserFailureClassification::MalformedJson,
                 bytes,
@@ -519,7 +519,7 @@ pub fn parse_if_interested_with_diagnostics(
                 frame_len = diagnostic.frame_len,
                 digest = %diagnostic.digest,
                 event_type = ?diagnostic.event_type,
-                error = %err,
+                error = %_err,
                 "Skipping malformed WS frame"
             );
             return Ok(ParsedMessages {
@@ -562,7 +562,7 @@ pub fn parse_if_interested_with_diagnostics(
                             diagnostics: Vec::new(),
                             items: vec![ParsedItem::Message(msg)],
                         }),
-                        Err(err) => {
+                        Err(_err) => {
                             let diagnostic = ParserDiagnostic::new(
                                 ParserFailureClassification::InvalidInterestedFrame,
                                 bytes,
@@ -574,7 +574,7 @@ pub fn parse_if_interested_with_diagnostics(
                                 frame_len = diagnostic.frame_len,
                                 digest = %diagnostic.digest,
                                 event_type = %event_type,
-                                error = %err,
+                                error = %_err,
                                 "Skipping invalid interested WS frame"
                             );
                             Ok(ParsedMessages {
@@ -619,7 +619,7 @@ pub fn parse_if_interested_with_diagnostics(
                         messages.push(msg.clone());
                         items.push(ParsedItem::Message(msg));
                     }
-                    Err(err) => {
+                    Err(_err) => {
                         let diagnostic = ParserDiagnostic::new(
                             ParserFailureClassification::InvalidInterestedFrame,
                             elem_bytes.as_bytes(),
@@ -631,7 +631,7 @@ pub fn parse_if_interested_with_diagnostics(
                             frame_len = diagnostic.frame_len,
                             digest = %diagnostic.digest,
                             event_type = %event_type,
-                            error = %err,
+                            error = %_err,
                             "Skipping invalid interested WS batch element"
                         );
                         diagnostics.push(diagnostic.clone());

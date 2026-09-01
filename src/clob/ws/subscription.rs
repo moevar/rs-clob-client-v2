@@ -185,7 +185,7 @@ impl SubscriptionManager {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(%e, "Failed to re-subscribe to market channel");
                 #[cfg(not(feature = "tracing"))]
-                let _ = &e;
+                let _error: crate::Error = e;
             }
         }
 
@@ -209,7 +209,7 @@ impl SubscriptionManager {
                 #[cfg(feature = "tracing")]
                 tracing::warn!(%e, "Failed to re-subscribe to user channel");
                 #[cfg(not(feature = "tracing"))]
-                let _ = &e;
+                let _error: crate::Error = e;
             }
         }
     }
@@ -327,12 +327,12 @@ impl SubscriptionManager {
                             yield msg
                         }
                     }
+                    #[cfg(feature = "tracing")]
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
                         tracing::warn!("Subscription lagged, missed {n} messages — continuing");
                     }
+                    #[cfg(not(feature = "tracing"))]
+                    Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => {
                         break;
                     }
@@ -577,12 +577,12 @@ impl SubscriptionManager {
                             yield msg;
                         }
                     }
+                    #[cfg(feature = "tracing")]
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
                         tracing::warn!("Subscription lagged, missed {n} messages — continuing");
                     }
+                    #[cfg(not(feature = "tracing"))]
+                    Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => {
                         break;
                     }
