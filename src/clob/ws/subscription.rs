@@ -16,13 +16,17 @@ use tokio::sync::broadcast::error::RecvError;
 use super::interest::{InterestTracker, MessageInterest};
 use super::types::request::SubscriptionRequest;
 use super::types::response::WsMessage;
-use super::types::stream::{MarketStreamContinuity, MarketStreamEvent, MarketStreamTerminal};
+use super::types::stream::{
+    MarketRawStreamEvent, MarketStreamContinuity, MarketStreamEvent, MarketStreamTerminal,
+};
 use crate::Result;
 use crate::auth::Credentials;
 use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::connection::ConnectionState;
-use crate::ws::{ConnectionDiagnosticKind, ConnectionEvent, ConnectionGeneration, WsError};
+use crate::ws::{
+    ConnectionDiagnosticKind, ConnectionEvent, ConnectionGeneration, RawConnectionEvent, WsError,
+};
 
 /// What a subscription is targeting.
 #[non_exhaustive]
@@ -413,6 +417,78 @@ impl SubscriptionManager {
                     }
                     Err(RecvError::Closed) => {
                         yield MarketStreamEvent::Terminal {
+                            generation: connection.generation(),
+                            reason: MarketStreamTerminal::ChannelClosed,
+                        };
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Subscribe to raw market-channel frames and lifecycle events on the existing connection.
+    pub fn subscribe_market_raw_events(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<MarketRawStreamEvent>> + use<>> {
+        let connection = self.connection.clone();
+        let mut raw_rx = connection.subscribe_raw_events();
+        self.register_market_subscription(asset_ids, true)?;
+
+        Ok(try_stream! {
+            loop {
+                match raw_rx.recv().await {
+                    Ok(RawConnectionEvent::Inbound(frame)) => {
+                        yield MarketRawStreamEvent::Inbound {
+                            generation: frame.generation,
+                            protocol: frame.protocol,
+                            bytes: frame.bytes,
+                        };
+                    }
+                    Ok(RawConnectionEvent::Outbound(frame)) => {
+                        yield MarketRawStreamEvent::Outbound {
+                            generation: frame.generation,
+                            protocol: frame.protocol,
+                            bytes: frame.bytes,
+                        };
+                    }
+                    Ok(RawConnectionEvent::Diagnostic(diagnostic)) => {
+                        match diagnostic.kind {
+                            ConnectionDiagnosticKind::ReconnectExhausted { attempts } => {
+                                yield MarketRawStreamEvent::Terminal {
+                                    generation: diagnostic.generation,
+                                    reason: MarketStreamTerminal::ReconnectExhausted { attempts },
+                                };
+                                break;
+                            }
+                            ConnectionDiagnosticKind::Shutdown => {
+                                yield MarketRawStreamEvent::Terminal {
+                                    generation: diagnostic.generation,
+                                    reason: MarketStreamTerminal::Shutdown,
+                                };
+                                break;
+                            }
+                            kind => {
+                                if let Some(reason) =
+                                    MarketStreamContinuity::from_connection_diagnostic(kind)
+                                {
+                                    yield MarketRawStreamEvent::Continuity {
+                                        generation: diagnostic.generation,
+                                        reason,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        yield MarketRawStreamEvent::Continuity {
+                            generation: connection.generation(),
+                            reason: MarketStreamContinuity::Lagged { missed: n },
+                        };
+                    }
+                    Err(RecvError::Closed) => {
+                        yield MarketRawStreamEvent::Terminal {
                             generation: connection.generation(),
                             reason: MarketStreamTerminal::ChannelClosed,
                         };

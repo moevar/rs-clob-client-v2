@@ -1,7 +1,9 @@
 use std::fmt;
 
 use crate::clob::ws::types::response::WsMessage;
-use crate::ws::{ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic};
+use crate::ws::{
+    ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic, RawFrameProtocol,
+};
 
 /// Consumer-visible event from the ordered public market stream.
 #[non_exhaustive]
@@ -34,12 +36,63 @@ pub enum MarketStreamEvent {
     },
 }
 
+/// Consumer-visible raw event from the public market stream.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketRawStreamEvent {
+    /// Inbound frame bytes captured before parser handling.
+    Inbound {
+        /// Immutable connection generation for this frame.
+        generation: ConnectionGeneration,
+        /// Wire protocol used by the frame.
+        protocol: RawFrameProtocol,
+        /// Byte-exact payload.
+        bytes: Vec<u8>,
+    },
+    /// Outbound frame bytes captured after the socket write succeeds.
+    Outbound {
+        /// Immutable connection generation for this frame.
+        generation: ConnectionGeneration,
+        /// Wire protocol used by the frame.
+        protocol: RawFrameProtocol,
+        /// Byte-exact payload.
+        bytes: Vec<u8>,
+    },
+    /// A non-terminal connection lifecycle or parser boundary.
+    Continuity {
+        /// Immutable connection generation affected by this boundary.
+        generation: ConnectionGeneration,
+        /// Typed boundary reason.
+        reason: MarketStreamContinuity,
+    },
+    /// Terminal stream closure evidence.
+    Terminal {
+        /// Immutable connection generation that closed or zero before any connection.
+        generation: ConnectionGeneration,
+        /// Typed terminal reason.
+        reason: MarketStreamTerminal,
+    },
+}
+
 impl MarketStreamEvent {
     /// Return the generation attached to this event.
     #[must_use]
     pub const fn generation(&self) -> ConnectionGeneration {
         match self {
             Self::Message { generation, .. }
+            | Self::Continuity { generation, .. }
+            | Self::Terminal { generation, .. } => *generation,
+        }
+    }
+}
+
+impl MarketRawStreamEvent {
+    /// Return the generation attached to this event.
+    #[must_use]
+    pub const fn generation(&self) -> ConnectionGeneration {
+        match self {
+            Self::Inbound { generation, .. }
+            | Self::Outbound { generation, .. }
             | Self::Continuity { generation, .. }
             | Self::Terminal { generation, .. } => *generation,
         }
