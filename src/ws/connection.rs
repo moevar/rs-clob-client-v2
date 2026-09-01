@@ -33,6 +33,17 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
+fn emit_raw_event_if_observed<F>(
+    raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
+    build_event: F,
+) where
+    F: FnOnce() -> RawConnectionEvent,
+{
+    if raw_event_tx.receiver_count() > 0 {
+        _ = raw_event_tx.send(build_event());
+    }
+}
+
 /// Connection state tracking.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,18 +523,17 @@ where
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
 
-                            let bytes = text.as_bytes().to_vec();
-                            Self::emit_raw_event(
-                                raw_event_tx,
+                            let bytes = text.as_bytes();
+                            emit_raw_event_if_observed(raw_event_tx, || {
                                 RawConnectionEvent::Inbound(RawFrame::new(
                                     generation,
                                     RawFrameProtocol::Text,
-                                    bytes.clone(),
-                                )),
-                            );
+                                    bytes.to_vec(),
+                                ))
+                            });
 
                             // Parse messages using the provided parser
-                            match parser.parse_with_diagnostics(&bytes) {
+                            match parser.parse_with_diagnostics(bytes) {
                                 Ok(parsed) => {
                                     if parsed.items.is_empty() {
                                         for diagnostic in parsed.diagnostics {
@@ -570,7 +580,7 @@ where
                                 Err(e) => {
                                     let diagnostic = ParserDiagnostic::new(
                                         ParserFailureClassification::MalformedJson,
-                                        &bytes,
+                                        bytes,
                                         None,
                                     );
                                     Self::emit_parser_diagnostic(
@@ -608,14 +618,14 @@ where
                             ));
                         }
                         Ok(Message::Binary(bytes)) => {
-                            Self::emit_raw_event(
-                                raw_event_tx,
+                            let bytes = bytes.as_ref();
+                            emit_raw_event_if_observed(raw_event_tx, || {
                                 RawConnectionEvent::Inbound(RawFrame::new(
                                     generation,
                                     RawFrameProtocol::Binary,
                                     bytes.to_vec(),
-                                )),
-                            );
+                                ))
+                            });
                         }
                         _ => {
                             // Ignore unsolicited PONG replies.
@@ -625,7 +635,7 @@ where
 
                 // Handle outgoing messages from subscriptions
                 Some(text) = sender_rx.recv() => {
-                    let bytes = text.as_bytes().to_vec();
+                    let raw_text = (raw_event_tx.receiver_count() > 0).then(|| text.clone());
                     if write.send(Message::Text(text.into())).await.is_err() {
                         Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                             generation,
@@ -636,17 +646,20 @@ where
                             WsError::ConnectionClosed,
                         ));
                     }
-                    Self::emit_raw_event(
-                        raw_event_tx,
-                        RawConnectionEvent::Outbound(RawFrame::new(
-                            generation,
-                            RawFrameProtocol::Text,
-                            bytes,
-                        )),
-                    );
+                    if let Some(raw_text) = raw_text {
+                        Self::emit_raw_event(
+                            raw_event_tx,
+                            RawConnectionEvent::Outbound(RawFrame::new(
+                                generation,
+                                RawFrameProtocol::Text,
+                                raw_text.into_bytes(),
+                            )),
+                        );
+                    }
                 }
 
-                // Handle PING requests from heartbeat loop
+                // Handle PING requests from heartbeat loop. These application-level heartbeats
+                // are not subscription evidence for raw market consumers.
                 Some(()) = ping_rx.recv() => {
                     if write.send(Message::Text("PING".into())).await.is_err() {
                         Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
@@ -658,14 +671,6 @@ where
                             WsError::ConnectionClosed,
                         ));
                     }
-                    Self::emit_raw_event(
-                        raw_event_tx,
-                        RawConnectionEvent::Outbound(RawFrame::new(
-                            generation,
-                            RawFrameProtocol::Text,
-                            b"PING".to_vec(),
-                        )),
-                    );
                 }
 
                 Some(()) = heartbeat_timeout_rx.recv() => {
@@ -817,8 +822,12 @@ where
         diagnostic: ConnectionDiagnostic,
     ) {
         _ = diagnostic_tx.send(diagnostic.clone());
-        _ = event_tx.send(ConnectionEvent::Diagnostic(diagnostic.clone()));
-        _ = raw_event_tx.send(RawConnectionEvent::Diagnostic(diagnostic));
+        if raw_event_tx.receiver_count() > 0 {
+            _ = event_tx.send(ConnectionEvent::Diagnostic(diagnostic.clone()));
+            _ = raw_event_tx.send(RawConnectionEvent::Diagnostic(diagnostic));
+        } else {
+            _ = event_tx.send(ConnectionEvent::Diagnostic(diagnostic));
+        }
     }
 
     fn emit_reconnect_write_unavailable(&self) {
@@ -985,5 +994,46 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
         if *shutdown_rx.borrow() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn raw_frame_builder_runs_only_when_raw_observers_exist() {
+        let (tx, _) = broadcast::channel(1);
+        let builds = Cell::new(0);
+
+        emit_raw_event_if_observed(&tx, || {
+            builds.set(builds.get() + 1);
+            RawConnectionEvent::Inbound(RawFrame::new(
+                ConnectionGeneration(1),
+                RawFrameProtocol::Text,
+                b"unobserved".to_vec(),
+            ))
+        });
+
+        assert_eq!(builds.get(), 0);
+
+        let mut rx = tx.subscribe();
+        emit_raw_event_if_observed(&tx, || {
+            builds.set(builds.get() + 1);
+            RawConnectionEvent::Inbound(RawFrame::new(
+                ConnectionGeneration(1),
+                RawFrameProtocol::Text,
+                b"observed".to_vec(),
+            ))
+        });
+
+        assert_eq!(builds.get(), 1);
+        let RawConnectionEvent::Inbound(frame) = rx.try_recv().expect("raw event is delivered")
+        else {
+            panic!("expected inbound raw frame");
+        };
+        assert_eq!(frame.bytes, b"observed");
     }
 }

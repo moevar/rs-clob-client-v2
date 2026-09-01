@@ -2910,6 +2910,40 @@ mod raw_market_stream {
     }
 
     #[tokio::test]
+    async fn heartbeat_ping_is_not_raw_subscription_evidence() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let mut config = Config::default();
+        config.heartbeat_interval = Duration::from_millis(25);
+        config.heartbeat_timeout = Duration::from_secs(5);
+        let client = Client::new(&endpoint, config).unwrap();
+
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        let deadline = tokio::time::sleep(Duration::from_millis(150));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                maybe = raw_stream.next() => {
+                    let event = maybe
+                        .expect("raw stream stays open")
+                        .expect("raw event remains ok");
+                    if let MarketRawStreamEvent::Outbound { bytes, .. } = event {
+                        assert_ne!(bytes, b"PING");
+                    }
+                }
+                () = &mut deadline => break,
+            }
+        }
+
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn t0370a_sdk_007_reconnect_boundary_precedes_later_raw_frame() {
         let mut server = RawMockServer::start().await;
         let endpoint = server.ws_url("/ws/market");
