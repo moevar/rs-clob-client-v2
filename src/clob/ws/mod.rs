@@ -22,6 +22,6 @@ pub use types::stream::{
 };
 
 pub use crate::ws::{
-    ConnectionDiagnostic, ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic,
-    ParserFailureClassification, RawFrameProtocol, WsError,
+    ConnectionDiagnostic, ConnectionDiagnosticKind, ConnectionGeneration, FrameTime,
+    ParserDiagnostic, ParserFailureClassification, RawFrameProtocol, WsError,
 };

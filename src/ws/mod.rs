@@ -34,5 +34,5 @@ pub use connection::{
     reason = "WsError includes module name for clarity when used outside this module"
 )]
 pub use error::WsError;
-pub use raw_event::{RawConnectionEvent, RawFrame, RawFrameProtocol};
+pub use raw_event::{FrameTime, RawConnectionEvent, RawFrame, RawFrameProtocol};
 pub use traits::*;

@@ -17,11 +17,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::config::Config;
 use super::error::WsError;
-use super::raw_event::{RawConnectionEvent, RawFrame, RawFrameProtocol};
+use super::raw_event::{FrameTime, RawConnectionEvent, RawFrame, RawFrameProtocol};
 use super::traits::{MessageParser, ParsedItem, ParserDiagnostic, ParserFailureClassification};
 use crate::auth::Credentials;
 use crate::error::Kind;
@@ -32,6 +34,15 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// The close frame payload as on the wire: the status code (big-endian), then the reason.
+fn close_payload(frame: Option<&CloseFrame>) -> Vec<u8> {
+    frame.map_or_else(Vec::new, |frame| {
+        let mut bytes = u16::from(frame.code).to_be_bytes().to_vec();
+        bytes.extend_from_slice(frame.reason.as_bytes());
+        bytes
+    })
+}
 
 fn emit_raw_event_if_observed<F>(
     raw_event_tx: &broadcast::Sender<RawConnectionEvent>,
@@ -515,6 +526,7 @@ where
 
                 // Handle incoming messages
                 Some(msg) = read.next() => {
+                    let observed_at = FrameTime::now();
                     match msg {
                         Ok(Message::Text(text)) if text == "PONG" => {
                             _ = pong_tx.send(Instant::now());
@@ -529,6 +541,7 @@ where
                                     generation,
                                     RawFrameProtocol::Text,
                                     bytes.to_vec(),
+                                    observed_at,
                                 ))
                             });
 
@@ -597,7 +610,15 @@ where
                                 }
                             }
                         }
-                        Ok(Message::Close(_)) => {
+                        Ok(Message::Close(frame)) => {
+                            emit_raw_event_if_observed(raw_event_tx, || {
+                                RawConnectionEvent::Inbound(RawFrame::new(
+                                    generation,
+                                    RawFrameProtocol::Close,
+                                    close_payload(frame.as_ref()),
+                                    observed_at,
+                                ))
+                            });
                             Self::emit_diagnostic(diagnostic_tx, event_tx, raw_event_tx, ConnectionDiagnostic {
                                 generation,
                                 kind: ConnectionDiagnosticKind::ConnectionClosed,
@@ -624,6 +645,7 @@ where
                                     generation,
                                     RawFrameProtocol::Binary,
                                     bytes.to_vec(),
+                                    observed_at,
                                 ))
                             });
                         }
@@ -653,6 +675,7 @@ where
                                 generation,
                                 RawFrameProtocol::Text,
                                 raw_text.into_bytes(),
+                                FrameTime::now(),
                             )),
                         );
                     }
@@ -1014,6 +1037,7 @@ mod tests {
                 ConnectionGeneration(1),
                 RawFrameProtocol::Text,
                 b"unobserved".to_vec(),
+                FrameTime::now(),
             ))
         });
 
@@ -1026,6 +1050,7 @@ mod tests {
                 ConnectionGeneration(1),
                 RawFrameProtocol::Text,
                 b"observed".to_vec(),
+                FrameTime::now(),
             ))
         });
 
