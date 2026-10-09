@@ -444,6 +444,7 @@ impl SubscriptionManager {
                             generation: frame.generation,
                             protocol: frame.protocol,
                             bytes: frame.bytes,
+                            observed_at: frame.observed_at,
                         };
                     }
                     Ok(RawConnectionEvent::Outbound(frame)) => {
@@ -451,6 +452,7 @@ impl SubscriptionManager {
                             generation: frame.generation,
                             protocol: frame.protocol,
                             bytes: frame.bytes,
+                            observed_at: frame.observed_at,
                         };
                     }
                     Ok(RawConnectionEvent::Diagnostic(diagnostic)) => {

@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::clob::ws::types::response::WsMessage;
 use crate::ws::{
-    ConnectionDiagnosticKind, ConnectionGeneration, ParserDiagnostic, RawFrameProtocol,
+    ConnectionDiagnosticKind, ConnectionGeneration, FrameTime, ParserDiagnostic, RawFrameProtocol,
 };
 
 /// Consumer-visible event from the ordered public market stream.
@@ -48,6 +48,8 @@ pub enum MarketRawStreamEvent {
         protocol: RawFrameProtocol,
         /// Byte-exact payload.
         bytes: Vec<u8>,
+        /// When the frame was read from the socket.
+        observed_at: FrameTime,
     },
     /// Outbound frame bytes captured after the socket write succeeds.
     Outbound {
@@ -57,6 +59,8 @@ pub enum MarketRawStreamEvent {
         protocol: RawFrameProtocol,
         /// Byte-exact payload.
         bytes: Vec<u8>,
+        /// When the write completed.
+        observed_at: FrameTime,
     },
     /// A non-terminal connection lifecycle or parser boundary.
     Continuity {
