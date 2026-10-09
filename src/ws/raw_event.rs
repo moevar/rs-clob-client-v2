@@ -12,8 +12,10 @@ pub enum RawFrameProtocol {
     Text,
     /// Binary frame bytes before parser handling.
     Binary,
-    /// Close frame payload as on the wire: the two-byte status code (big-endian) followed by the
-    /// UTF-8 reason. Empty when the frame carried no payload.
+    /// Close frame as the WebSocket library decoded it, laid out like the wire payload: the
+    /// two-byte status code (big-endian), then the UTF-8 reason; empty when the frame carried no
+    /// payload. The library replaces a code that is not allowed on the wire (such as 1005, 1006
+    /// or 1015) with 1002 and the reason `Protocol violation`, so those bytes are not the peer's.
     Close,
 }
 

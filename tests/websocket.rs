@@ -2595,12 +2595,12 @@ mod raw_market_stream {
             drop(self.frame_tx.send(Message::Binary(bytes.to_vec().into())));
         }
 
-        fn send_close(&self, code: u16, reason: &str) {
-            let frame = CloseFrame {
+        fn send_close(&self, frame: Option<(u16, &str)>) {
+            let frame = frame.map(|(code, reason)| CloseFrame {
                 code: CloseCode::from(code),
                 reason: reason.to_owned().into(),
-            };
-            drop(self.frame_tx.send(Message::Close(Some(frame))));
+            });
+            drop(self.frame_tx.send(Message::Close(frame)));
         }
 
         fn disconnect_all(&self) {
@@ -3178,7 +3178,7 @@ mod raw_market_stream {
         let _: Option<String> = server.recv_subscription().await;
 
         // 1013 is the venue's close for a slow consumer.
-        server.send_close(1013, "slow consumer");
+        server.send_close(Some((1013, "slow consumer")));
         let (generation, bytes) =
             next_inbound_frame(&mut raw_stream, RawFrameProtocol::Close).await;
         assert_eq!(bytes, b"\x03\xf5slow consumer");
@@ -3193,6 +3193,42 @@ mod raw_market_stream {
                 break;
             }
         }
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_venue_close_frame_has_an_empty_payload() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.send_close(None);
+        let (_, bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Close).await;
+        assert!(bytes.is_empty());
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_close_code_not_allowed_on_the_wire_arrives_as_the_library_replacement() {
+        let mut server = RawMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+        let raw_stream = client
+            .subscribe_market_raw_events(vec![payloads::asset_id()])
+            .unwrap();
+        let mut raw_stream = Box::pin(raw_stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        // 1005 must not be sent on the wire; tungstenite replaces it with 1002 before the SDK
+        // sees the frame, so the tap cannot report the peer's bytes.
+        server.send_close(Some((1005, "no status")));
+        let (_, bytes) = next_inbound_frame(&mut raw_stream, RawFrameProtocol::Close).await;
+        assert_eq!(bytes, b"\x03\xeaProtocol violation");
         client.close().await.unwrap();
     }
 }

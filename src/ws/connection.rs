@@ -35,7 +35,9 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
-/// The close frame payload as on the wire: the status code (big-endian), then the reason.
+/// The close frame as tungstenite decoded it, laid out like the wire payload: the status code
+/// (big-endian), then the reason. Tungstenite has already replaced a code not allowed on the wire
+/// with 1002 `Protocol violation`.
 fn close_payload(frame: Option<&CloseFrame>) -> Vec<u8> {
     frame.map_or_else(Vec::new, |frame| {
         let mut bytes = u16::from(frame.code).to_be_bytes().to_vec();
