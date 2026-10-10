@@ -314,6 +314,48 @@ async fn request<Response: DeserializeOwned>(
     }
 }
 
+/// Sends `request` like [`request`], but returns the body as received, unparsed.
+#[cfg(feature = "clob")]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        level = "debug",
+        skip(client, request),
+        fields(
+            method = %request.method(),
+            path = request.url().path(),
+            status_code
+        )
+    )
+)]
+async fn request_raw(client: &reqwest::Client, request: Request) -> Result<Vec<u8>> {
+    let method = request.method().clone();
+    let path = request.url().path().to_owned();
+
+    let response = client.execute(request).await?;
+    let status_code = response.status();
+
+    #[cfg(feature = "tracing")]
+    tracing::Span::current().record("status_code", status_code.as_u16());
+
+    if !status_code.is_success() {
+        let message = response.text().await.unwrap_or_default();
+
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            status = %status_code,
+            method = %method,
+            path = %path,
+            message = %message,
+            "API request failed"
+        );
+
+        return Err(Error::status(status_code, method, path, message));
+    }
+
+    Ok(Vec::from(response.bytes().await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3450,6 +3450,35 @@ mod v2 {
         use super::*;
 
         #[tokio::test]
+        async fn v2_limit_build_should_use_set_version_without_request() -> anyhow::Result<()> {
+            let server = MockServer::start();
+            let client = create_authenticated(&server).await?;
+
+            // A read would make this a V1 build, which needs `/fee-rate`
+            let version = server.mock(|when, then| {
+                when.method(httpmock::Method::GET).path("/version");
+                then.status(StatusCode::OK)
+                    .json_body(json!({ "version": 1 }));
+            });
+            client.set_version(2);
+            client.set_tick_size(token_1(), TickSize::Hundredth);
+
+            let signable = client
+                .limit_order()
+                .token_id(token_1())
+                .price(dec!(0.50))
+                .size(Decimal::ONE_HUNDRED)
+                .side(Side::Buy)
+                .build()
+                .await?;
+
+            assert_eq!(signable.payload.version(), 2);
+            version.assert_calls(0);
+
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn v2_limit_buy_should_succeed() -> anyhow::Result<()> {
             let server = MockServer::start();
             let client = create_authenticated(&server).await?;
