@@ -677,6 +677,15 @@ impl<S: State> Client<S> {
         self.inner.fee_rate_bps.insert(token_id, fee_rate);
     }
 
+    /// Sets the cached server version, avoiding the `/version` call when an order is built.
+    ///
+    /// Replaces a version already cached; `0` clears it, so the next build reads `/version`.
+    /// Use this when you already have the version from another source (e.g. your own read of
+    /// `/version`).
+    pub fn set_version(&self, version: u32) {
+        self.inner.cached_version.store(version, Ordering::Relaxed);
+    }
+
     /// Checks if the CLOB API is healthy and operational.
     ///
     /// Returns "OK" if the API is functioning properly. This method is useful
@@ -736,6 +745,22 @@ impl<S: State> Client<S> {
             .cached_version
             .store(body.version, Ordering::Relaxed);
         Ok(body.version)
+    }
+
+    /// Sends a GET to `path` on the host and returns the response body as received, without
+    /// parsing it or filling any cache. `path` is relative to the host, without a leading slash
+    /// (e.g. `version` or `clob-markets/{condition_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response status is not a success.
+    pub async fn get_raw(&self, path: &str) -> Result<Vec<u8>> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}{path}", self.host()))
+            .build()?;
+
+        crate::request_raw(&self.inner.client, request).await
     }
 
     /// Retrieves the midpoint price for a single exchange asset.

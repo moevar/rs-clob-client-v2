@@ -472,6 +472,87 @@ mod unauthenticated {
     }
 
     #[tokio::test]
+    async fn set_version_should_replace_cached_version() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = Client::new(&server.base_url(), Config::default())?;
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/version");
+            then.status(StatusCode::OK)
+                .json_body(json!({ "version": 1 }));
+        });
+
+        assert_eq!(client.version().await?, 1);
+
+        // Replaces the version read above, without another request
+        client.set_version(2);
+
+        assert_eq!(client.version().await?, 2);
+        mock.assert_calls(1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_raw_should_return_body_and_fill_no_cache() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = Client::new(&server.base_url(), Config::default())?;
+
+        // A market body that `clob_market_info` would cache, spaced as no serializer would
+        let body = format!(
+            r#"{{ "t": [{{"t": "{}", "o": "Up"}}],  "mts": 0.001 }}"#,
+            token_1()
+        );
+        let raw = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/clob-markets/0x01");
+            then.status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(&body);
+        });
+        let tick_size = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/tick-size")
+                .query_param("token_id", token_1().to_string());
+            then.status(StatusCode::OK)
+                .json_body(json!({ "minimum_tick_size": "0.01" }));
+        });
+
+        assert_eq!(client.get_raw("clob-markets/0x01").await?, body.as_bytes());
+
+        // The tick size was not cached from the body, so it is read from `/tick-size`
+        let response = client.tick_size(token_1()).await?;
+
+        assert_eq!(response.minimum_tick_size, TickSize::Hundredth);
+        raw.assert();
+        tick_size.assert();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_raw_should_return_status_error() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = Client::new(&server.base_url(), Config::default())?;
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/clob-markets/0x01");
+            then.status(StatusCode::NOT_FOUND).body("market not found");
+        });
+
+        let err = client.get_raw("clob-markets/0x01").await.unwrap_err();
+        let status = err.downcast_ref::<Status>().unwrap();
+
+        assert_eq!(status.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(status.path, "/clob-markets/0x01");
+        assert_eq!(status.message, "market not found");
+        mock.assert();
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invalidate_caches_should_clear_prepopulated_values() -> anyhow::Result<()> {
         let server = MockServer::start();
         let client = Client::new(&server.base_url(), Config::default())?;
