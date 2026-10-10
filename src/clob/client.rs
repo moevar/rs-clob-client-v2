@@ -679,7 +679,8 @@ impl<S: State> Client<S> {
 
     /// Sets the cached server version, avoiding the `/version` call when an order is built.
     ///
-    /// Replaces a version already cached; `0` clears it, so the next build reads `/version`.
+    /// Replaces a version already cached; `0` clears it, so the version is read from `/version`
+    /// when it is next needed.
     /// Use this when you already have the version from another source (e.g. your own read of
     /// `/version`).
     pub fn set_version(&self, version: u32) {
