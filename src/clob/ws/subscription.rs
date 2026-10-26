@@ -92,6 +92,20 @@ pub enum ChannelType {
     User,
 }
 
+/// The `Connected` continuity of `generation`, unless the stream already announced it.
+fn announce(
+    announced: &mut Option<ConnectionGeneration>,
+    generation: ConnectionGeneration,
+) -> Option<MarketRawStreamEvent> {
+    (*announced != Some(generation)).then(|| {
+        *announced = Some(generation);
+        MarketRawStreamEvent::Continuity {
+            generation,
+            reason: MarketStreamContinuity::Connected,
+        }
+    })
+}
+
 /// Manages active subscriptions and routes messages to subscribers.
 pub struct SubscriptionManager {
     connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
@@ -126,12 +140,17 @@ impl SubscriptionManager {
     }
 
     /// Start the reconnection handler that re-subscribes on connection recovery.
+    ///
+    /// The connection's generation decides, not the state the task first reads, so a task that
+    /// first runs late neither replays the first connection's subscriptions nor misses a reconnect.
     pub fn start_reconnection_handler(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let mut state_rx = this.connection.state_receiver();
 
         tokio::spawn(async move {
-            let mut was_connected = state_rx.borrow().is_connected();
+            // The newest generation that has every subscription: the first sends the requests
+            // queued before it.
+            let mut subscribed = ConnectionGeneration(1);
 
             loop {
                 // Wait for next state change
@@ -144,13 +163,14 @@ impl SubscriptionManager {
 
                 match state {
                     ConnectionState::Connected { .. } => {
-                        if was_connected {
+                        let generation = this.connection.generation();
+                        if generation > subscribed {
                             // Reconnect to subscriptions
                             #[cfg(feature = "tracing")]
                             tracing::debug!("WebSocket reconnected, re-establishing subscriptions");
                             this.resubscribe_all();
+                            subscribed = generation;
                         }
-                        was_connected = true;
                     }
                     ConnectionState::Disconnected => {
                         // Connection permanently closed
@@ -437,9 +457,16 @@ impl SubscriptionManager {
         self.register_market_subscription(asset_ids, true)?;
 
         Ok(try_stream! {
+            // A receiver taken after a connection came up never gets its `Connected`, so a
+            // generation's first frame announces it too, once.
+            let mut announced: Option<ConnectionGeneration> = None;
+
             loop {
                 match raw_rx.recv().await {
                     Ok(RawConnectionEvent::Inbound(frame)) => {
+                        if let Some(connected) = announce(&mut announced, frame.generation) {
+                            yield connected;
+                        }
                         yield MarketRawStreamEvent::Inbound {
                             generation: frame.generation,
                             protocol: frame.protocol,
@@ -448,6 +475,9 @@ impl SubscriptionManager {
                         };
                     }
                     Ok(RawConnectionEvent::Outbound(frame)) => {
+                        if let Some(connected) = announce(&mut announced, frame.generation) {
+                            yield connected;
+                        }
                         yield MarketRawStreamEvent::Outbound {
                             generation: frame.generation,
                             protocol: frame.protocol,
@@ -457,6 +487,13 @@ impl SubscriptionManager {
                     }
                     Ok(RawConnectionEvent::Diagnostic(diagnostic)) => {
                         match diagnostic.kind {
+                            ConnectionDiagnosticKind::Connected => {
+                                if let Some(connected) =
+                                    announce(&mut announced, diagnostic.generation)
+                                {
+                                    yield connected;
+                                }
+                            }
                             ConnectionDiagnosticKind::ReconnectExhausted { attempts } => {
                                 yield MarketRawStreamEvent::Terminal {
                                     generation: diagnostic.generation,

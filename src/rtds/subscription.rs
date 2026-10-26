@@ -17,7 +17,7 @@ use super::types::response::{RtdsMessage, parse_messages};
 use crate::Result;
 use crate::auth::Credentials;
 use crate::ws::ConnectionManager;
-use crate::ws::connection::ConnectionState;
+use crate::ws::connection::{ConnectionGeneration, ConnectionState};
 
 #[non_exhaustive]
 #[derive(Clone)]
@@ -83,12 +83,17 @@ impl SubscriptionManager {
     }
 
     /// Start the reconnection handler that re-subscribes on connection recovery.
+    ///
+    /// The connection's generation decides, not the state the task first reads, so a task that
+    /// first runs late neither replays the first connection's subscriptions nor misses a reconnect.
     pub fn start_reconnection_handler(self: &Arc<Self>) {
         let this = Arc::clone(self);
+        let mut state_rx = this.connection.state_receiver();
 
         tokio::spawn(async move {
-            let mut state_rx = this.connection.state_receiver();
-            let mut was_connected = state_rx.borrow().is_connected();
+            // The newest generation that has every subscription: the first sends the requests
+            // queued before it.
+            let mut subscribed = ConnectionGeneration(1);
 
             loop {
                 // Wait for next state change
@@ -101,13 +106,14 @@ impl SubscriptionManager {
 
                 match state {
                     ConnectionState::Connected { .. } => {
-                        if was_connected {
+                        let generation = this.connection.generation();
+                        if generation > subscribed {
                             // Reconnect to subscriptions
                             #[cfg(feature = "tracing")]
                             tracing::debug!("RTDS reconnected, re-establishing subscriptions");
                             this.resubscribe_all();
+                            subscribed = generation;
                         }
-                        was_connected = true;
                     }
                     ConnectionState::Disconnected => {
                         // Connection permanently closed
