@@ -34,8 +34,8 @@ type Connection = ConnectionManager<WsMessage, Arc<InterestTracker>>;
 
 /// A market channel double that completes no handshake until it is opened, and passes on every
 /// text frame a client sends but its heartbeat, in order, with the number of the connection it came
-/// on. It sends its connections the frames it is given. If told to, it closes the first connection
-/// after its first request.
+/// on. It answers each heartbeat and sends its connections the frames it is given. If told to, it
+/// closes the first connection after its first request.
 struct Server {
     addr: SocketAddr,
     gate: Arc<Notify>,
@@ -64,8 +64,14 @@ impl Server {
                     let sent = sent.clone();
                     let (mut write, mut read) = socket.split();
                     let mut given = frames.subscribe();
+                    let (pong, mut pongs) = mpsc::unbounded_channel();
                     let writer = tokio::spawn(async move {
-                        while let Ok(frame) = given.recv().await {
+                        loop {
+                            let frame = tokio::select! {
+                                Ok(frame) = given.recv() => frame,
+                                Some(()) = pongs.recv() => Message::Text("PONG".into()),
+                                else => break,
+                            };
                             if write.send(frame).await.is_err() {
                                 break;
                             }
@@ -73,13 +79,15 @@ impl Server {
                     });
                     tokio::spawn(async move {
                         while let Some(Ok(message)) = read.next().await {
-                            if let Message::Text(text) = message
-                                && text != "PING"
-                            {
-                                drop(sent.send((number, text.to_string())));
-                                if close_first && number == 1 {
-                                    break;
+                            match message {
+                                Message::Text(text) if text == "PING" => drop(pong.send(())),
+                                Message::Text(text) => {
+                                    drop(sent.send((number, text.to_string())));
+                                    if close_first && number == 1 {
+                                        break;
+                                    }
                                 }
+                                _ => {}
                             }
                         }
                         // Both halves go, so the connection closes.
