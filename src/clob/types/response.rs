@@ -287,6 +287,15 @@ pub struct ApiKeysResponse {
     keys: Option<Vec<ApiKey>>,
 }
 
+impl ApiKeysResponse {
+    /// The account's API keys; `None` when the response carried no list, which is distinct from
+    /// an empty list.
+    #[must_use]
+    pub fn keys(&self) -> Option<&[ApiKey]> {
+        self.keys.as_deref()
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Builder, PartialEq)]
 pub struct BanStatusResponse {

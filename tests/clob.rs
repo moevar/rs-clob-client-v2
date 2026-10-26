@@ -1590,7 +1590,19 @@ mod authenticated {
         let expected = ApiKeysResponse::builder().keys(vec![API_KEY]).build();
 
         assert_eq!(response, expected);
+        assert_eq!(response.keys(), Some(&[API_KEY][..]));
         mock.assert();
+
+        Ok(())
+    }
+
+    #[test]
+    fn api_keys_tells_a_missing_list_from_an_empty_one() -> anyhow::Result<()> {
+        let missing: ApiKeysResponse = serde_json::from_value(json!({}))?;
+        let empty: ApiKeysResponse = serde_json::from_value(json!({"apiKeys": []}))?;
+
+        assert_eq!(missing.keys(), None);
+        assert_eq!(empty.keys(), Some(&[][..]));
 
         Ok(())
     }
