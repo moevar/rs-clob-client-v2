@@ -1,5 +1,5 @@
 //! A request that changes state, answered with a redirect, reaches the venue once and goes nowhere
-//! else (PumpAmp V3 bug 0011).
+//! else.
 #![cfg(feature = "clob")]
 #![allow(
     clippy::unwrap_used,
@@ -29,18 +29,18 @@ use crate::common::{
 const REDIRECTS: [u16; 4] = [301, 302, 307, 308];
 
 /// `venue` answers `method path` with `status` and a `Location` on `target`, another origin.
-struct Redirect<'a> {
-    answered: Mock<'a>,
+struct Redirect<'server> {
+    answered: Mock<'server>,
     /// The followed requests that carried the SDK's signed headers.
-    signed: Mock<'a>,
+    signed: Mock<'server>,
     /// The followed requests without them.
-    unsigned: Mock<'a>,
+    unsigned: Mock<'server>,
 }
 
-impl<'a> Redirect<'a> {
+impl<'server> Redirect<'server> {
     fn new(
-        venue: &'a MockServer,
-        target: &'a MockServer,
+        venue: &'server MockServer,
+        target: &'server MockServer,
         method: Method,
         path: &str,
         status: u16,
