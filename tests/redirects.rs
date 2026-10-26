@@ -14,13 +14,15 @@ use std::str::FromStr as _;
 use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
 use httpmock::{Method, Mock, MockServer};
-use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::clob::types::{SignableOrder, TickSize};
 use polymarket_client_sdk_v2::clob::{Client, Config};
+use polymarket_client_sdk_v2::error::Status;
+use polymarket_client_sdk_v2::{POLYGON, Result};
 use serde_json::json;
 
 use crate::common::{
-    POLY_SIGNATURE, PRIVATE_KEY, create_authenticated, ensure_requirements, token_1,
+    API_KEY, PASSPHRASE, POLY_SIGNATURE, PRIVATE_KEY, SECRET, create_authenticated,
+    ensure_requirements, token_1,
 };
 
 /// The redirects whose `Location` a client could follow.
@@ -77,6 +79,21 @@ impl<'a> Redirect<'a> {
     }
 }
 
+/// What is wrong with the call's result, if anything: a stopped redirect comes back as its status,
+/// an unknown outcome for the caller.
+fn not_stopped<T: std::fmt::Debug>(status: u16, what: &str, result: &Result<T>) -> Option<String> {
+    let answer = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<Status>());
+    match answer {
+        Some(answer) if answer.status_code.as_u16() == status => None,
+        _ => Some(format!(
+            "a {status} answer to {what} didn't come back as it: {result:?}"
+        )),
+    }
+}
+
 /// Fails with every redirect that was followed.
 fn assert_none_followed(followed: &[String]) {
     assert!(followed.is_empty(), "{}", followed.join("\n"));
@@ -94,6 +111,7 @@ async fn an_order_answered_with_a_redirect_reaches_the_venue_once() -> anyhow::R
         let order = client.sign(&signer, SignableOrder::default()).await?;
         let result = client.post_order(order).await;
         followed.extend(redirect.followed(status, "POST /order", &result));
+        followed.extend(not_stopped(status, "POST /order", &result));
     }
     assert_none_followed(&followed);
     Ok(())
@@ -108,6 +126,7 @@ async fn a_cancel_answered_with_a_redirect_reaches_the_venue_once() -> anyhow::R
         let redirect = Redirect::new(&venue, &target, Method::DELETE, "/order", status);
         let result = client.cancel_order("1").await;
         followed.extend(redirect.followed(status, "DELETE /order", &result));
+        followed.extend(not_stopped(status, "DELETE /order", &result));
     }
     assert_none_followed(&followed);
     Ok(())
@@ -123,6 +142,37 @@ async fn a_key_creation_answered_with_a_redirect_reaches_the_venue_once() -> any
         let redirect = Redirect::new(&venue, &target, Method::POST, "/auth/api-key", status);
         let result = client.create_api_key(&signer, None).await;
         followed.extend(redirect.followed(status, "POST /auth/api-key", &result));
+        followed.extend(not_stopped(status, "POST /auth/api-key", &result));
+    }
+    assert_none_followed(&followed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticating_after_a_redirected_key_creation_derives_at_the_venue() -> anyhow::Result<()>
+{
+    let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(POLYGON));
+    let mut followed = Vec::new();
+    for status in REDIRECTS {
+        let (venue, target) = (MockServer::start(), MockServer::start());
+        let redirect = Redirect::new(&venue, &target, Method::POST, "/auth/api-key", status);
+        let derived = venue.mock(|when, then| {
+            when.method(Method::GET).path("/auth/derive-api-key");
+            then.status(200).json_body(json!({
+                "apiKey": API_KEY.to_string(),
+                "passphrase": PASSPHRASE,
+                "secret": SECRET
+            }));
+        });
+        let result = Client::new(&venue.base_url(), Config::default())?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+            .map(drop);
+        followed.extend(redirect.followed(status, "POST /auth/api-key in authenticate", &result));
+        // The create's stopped redirect is a status, which falls back to the venue's derive.
+        derived.assert_calls(1);
+        assert!(result.is_ok(), "{status}: {result:?}");
     }
     assert_none_followed(&followed);
     Ok(())
@@ -145,6 +195,7 @@ async fn a_deposit_answered_with_a_redirect_reaches_the_bridge_once() -> anyhow:
             .build();
         let result = client.deposit(&request).await;
         followed.extend(redirect.followed(status, "POST /deposit", &result));
+        followed.extend(not_stopped(status, "POST /deposit", &result));
     }
     assert_none_followed(&followed);
     Ok(())
