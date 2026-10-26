@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt as _};
+use futures_util::{SinkExt as _, Stream, StreamExt as _};
 use polymarket_client_sdk_v2::Result as SdkResult;
 use polymarket_client_sdk_v2::clob::ws::interest::InterestTracker;
 use polymarket_client_sdk_v2::clob::ws::subscription::SubscriptionManager;
@@ -20,11 +20,13 @@ use polymarket_client_sdk_v2::clob::ws::{
     Client, MarketRawStreamEvent, MarketStreamContinuity, SubscriptionRequest, WsMessage,
 };
 use polymarket_client_sdk_v2::types::U256;
-use polymarket_client_sdk_v2::ws::ConnectionManager;
 use polymarket_client_sdk_v2::ws::config::Config;
+use polymarket_client_sdk_v2::ws::{
+    ConnectionDiagnosticKind, ConnectionManager, RawConnectionEvent, RawFrameProtocol,
+};
 use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -32,11 +34,13 @@ type Connection = ConnectionManager<WsMessage, Arc<InterestTracker>>;
 
 /// A market channel double that completes no handshake until it is opened, and passes on every
 /// text frame a client sends but its heartbeat, in order, with the number of the connection it came
-/// on. If told to, it closes the first connection after its first request.
+/// on. It sends its connections the frames it is given. If told to, it closes the first connection
+/// after its first request.
 struct Server {
     addr: SocketAddr,
     gate: Arc<Notify>,
     requests: mpsc::UnboundedReceiver<(usize, String)>,
+    frames: broadcast::Sender<Message>,
 }
 
 impl Server {
@@ -45,8 +49,10 @@ impl Server {
         let addr = listener.local_addr().unwrap();
         let gate = Arc::new(Notify::new());
         let (sent, requests) = mpsc::unbounded_channel();
+        let (frames, _) = broadcast::channel(4096);
         tokio::spawn({
             let gate = Arc::clone(&gate);
+            let frames = frames.clone();
             async move {
                 gate.notified().await;
                 let mut number = 0;
@@ -56,8 +62,16 @@ impl Server {
                     };
                     number += 1;
                     let sent = sent.clone();
+                    let (mut write, mut read) = socket.split();
+                    let mut given = frames.subscribe();
+                    let writer = tokio::spawn(async move {
+                        while let Ok(frame) = given.recv().await {
+                            if write.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
                     tokio::spawn(async move {
-                        let (_write, mut read) = socket.split();
                         while let Some(Ok(message)) = read.next().await {
                             if let Message::Text(text) = message
                                 && text != "PING"
@@ -68,6 +82,8 @@ impl Server {
                                 }
                             }
                         }
+                        // Both halves go, so the connection closes.
+                        writer.abort();
                     });
                 }
             }
@@ -76,6 +92,7 @@ impl Server {
             addr,
             gate,
             requests,
+            frames,
         }
     }
 
@@ -86,6 +103,10 @@ impl Server {
     /// Lets the handshakes complete.
     fn open(&self) {
         self.gate.notify_one();
+    }
+
+    fn send(&self, frame: Message) {
+        self.frames.send(frame).unwrap();
     }
 
     async fn request(&mut self) -> (usize, String) {
@@ -291,5 +312,91 @@ async fn a_raw_stream_subscribed_before_the_first_connect_announces_it_once() {
     assert_eq!(
         announced, 1,
         "the first connection was announced {announced} times"
+    );
+}
+
+/// The raw stream lags past the first connection's `Connected` and a frame, and what it still holds
+/// starts with that frame's parser diagnostic: it announces the connection before the diagnostic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lagged_raw_stream_announces_a_connection_before_its_diagnostic() {
+    // The raw tap holds 1024 events. The `Connected`, the subscribe, then 520 malformed frames
+    // (each an inbound frame and its diagnostic), then a binary frame (no diagnostic): 1043
+    // events, so the unread stream lost the first 19 and holds the 9th frame's diagnostic first.
+    const CAPACITY: usize = 1024;
+    const MALFORMED: usize = 520;
+    let mut server = Server::start(false).await;
+    let mut config = Config::default();
+    config.heartbeat_interval = Duration::from_secs(60);
+    let interest = Arc::new(InterestTracker::default());
+    let connection: Connection =
+        ConnectionManager::new(server.endpoint(), config, Arc::clone(&interest)).unwrap();
+    // Both see every event from before the handshake: `all` as they come, `raw` only at the end.
+    let mut all = connection.subscribe_raw_events();
+    let subscriptions = SubscriptionManager::new(connection.clone(), interest);
+    let raw = subscriptions
+        .subscribe_market_raw_events(vec![U256::from(1_u8)])
+        .unwrap();
+    let mut raw = Box::pin(raw);
+    server.open();
+    assert_eq!(server.request().await.0, 1);
+
+    let mut events = Vec::new();
+    let mut take = async |until: usize, events: &mut Vec<RawConnectionEvent>| {
+        while events.len() < until {
+            let event = timeout(Duration::from_secs(5), all.recv()).await;
+            events.push(event.expect("an event").expect("no lag"));
+        }
+    };
+    // In batches, so `all` never lags.
+    for _ in 0..4 {
+        for _ in 0..MALFORMED / 4 {
+            server.send(Message::Text("not json".into()));
+        }
+        let until = events.len().max(2) + MALFORMED / 2;
+        take(until, &mut events).await;
+    }
+    server.send(Message::Binary(vec![0].into()));
+    take(2 + 2 * MALFORMED + 1, &mut events).await;
+    assert!(matches!(
+        events.last(),
+        Some(RawConnectionEvent::Inbound(frame)) if frame.protocol == RawFrameProtocol::Binary
+    ));
+    let lost = events.len() - CAPACITY;
+    assert!(
+        matches!(
+            &events[lost],
+            RawConnectionEvent::Diagnostic(diagnostic)
+                if matches!(diagnostic.kind, ConnectionDiagnosticKind::ParserFailure(_))
+        ),
+        "the setup didn't leave a diagnostic first: {:?}",
+        events[lost]
+    );
+
+    let lagged = next_raw(&mut raw).await;
+    assert!(
+        matches!(
+            lagged,
+            MarketRawStreamEvent::Continuity {
+                reason: MarketStreamContinuity::Lagged { missed },
+                ..
+            } if missed == lost as u64
+        ),
+        "{lagged:?}"
+    );
+    let announced = next_raw(&mut raw).await;
+    assert!(
+        connected(&announced, 1),
+        "the diagnostic came before the connection's announcement: {announced:?}"
+    );
+    let diagnostic = next_raw(&mut raw).await;
+    assert!(
+        matches!(
+            diagnostic,
+            MarketRawStreamEvent::Continuity {
+                reason: MarketStreamContinuity::ParserDiagnostic(_),
+                ..
+            }
+        ),
+        "{diagnostic:?}"
     );
 }

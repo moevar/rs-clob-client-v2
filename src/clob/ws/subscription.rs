@@ -92,13 +92,14 @@ pub enum ChannelType {
     User,
 }
 
-/// The `Connected` continuity of `generation`, unless the stream already announced it.
+/// The `Connected` continuity of `generation`, unless the stream announced it or a later one, or
+/// no connection was ever established (zero).
 fn announce(
-    announced: &mut Option<ConnectionGeneration>,
+    announced: &mut ConnectionGeneration,
     generation: ConnectionGeneration,
 ) -> Option<MarketRawStreamEvent> {
-    (*announced != Some(generation)).then(|| {
-        *announced = Some(generation);
+    (generation > *announced).then(|| {
+        *announced = generation;
         MarketRawStreamEvent::Continuity {
             generation,
             reason: MarketStreamContinuity::Connected,
@@ -457,9 +458,9 @@ impl SubscriptionManager {
         self.register_market_subscription(asset_ids, true)?;
 
         Ok(try_stream! {
-            // A receiver taken after a connection came up never gets its `Connected`, so a
-            // generation's first frame announces it too, once.
-            let mut announced: Option<ConnectionGeneration> = None;
+            // A receiver taken after a connection came up, or one that lagged past it, never gets
+            // its `Connected`, so a generation's first frame announces it too, once.
+            let mut announced = ConnectionGeneration::zero();
 
             loop {
                 match raw_rx.recv().await {
@@ -486,6 +487,14 @@ impl SubscriptionManager {
                         };
                     }
                     Ok(RawConnectionEvent::Diagnostic(diagnostic)) => {
+                        // A parser diagnostic comes from a frame of a live connection, so it
+                        // announces its generation as a frame does. The others can come after
+                        // their connection is gone, which an announcement would deny.
+                        if matches!(diagnostic.kind, ConnectionDiagnosticKind::ParserFailure(_))
+                            && let Some(connected) = announce(&mut announced, diagnostic.generation)
+                        {
+                            yield connected;
+                        }
                         match diagnostic.kind {
                             ConnectionDiagnosticKind::Connected => {
                                 if let Some(connected) =
