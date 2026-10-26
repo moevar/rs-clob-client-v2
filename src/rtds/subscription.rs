@@ -383,8 +383,8 @@ mod tests {
         serde_json::to_string(&SubscriptionRequest::subscribe(vec![subscription])).unwrap()
     }
 
-    /// The handler's task first runs once a reconnect has brought up the second connection
-    /// (PumpAmp V3 bug 0010). That connection still gets the subscriptions.
+    /// The handler's task first runs once a reconnect has brought up the second connection. That
+    /// connection still gets the subscriptions.
     #[test]
     fn a_handler_that_first_runs_after_a_reconnect_resubscribes() {
         // The connection runs on its own runtime; the handler's, a current-thread one, runs
@@ -425,7 +425,10 @@ mod tests {
             let mut generation = connection.generation_receiver();
             let mut state = connection.state_receiver();
             timeout(Duration::from_secs(5), async {
-                generation.wait_for(|generation| generation.0 == 2).await.unwrap();
+                generation
+                    .wait_for(|generation| generation.0 == 2)
+                    .await
+                    .unwrap();
                 state.wait_for(|state| state.is_connected()).await.unwrap();
             })
             .await
