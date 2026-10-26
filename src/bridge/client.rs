@@ -61,7 +61,12 @@ impl Client {
         headers.insert("Accept", HeaderValue::from_static("*/*"));
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        // No redirect is followed: a 307 or a 308 would send a deposit, a withdrawal or a quote
+        // again.
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         Ok(Self {
             host: Url::parse(host)?,

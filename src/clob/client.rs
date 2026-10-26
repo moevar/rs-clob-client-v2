@@ -1524,7 +1524,12 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        // No redirect is followed: a 307 or a 308 would send an order, a cancel or a key request
+        // again, and every redirect would take the signed headers to its target.
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         let geoblock_host = Url::parse(
             config
