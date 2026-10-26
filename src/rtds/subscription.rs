@@ -326,3 +326,118 @@ impl SubscriptionManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::StreamExt as _;
+    use tokio::net::TcpListener;
+    use tokio::runtime::Builder;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
+    use crate::ws::config::Config;
+
+    /// An RTDS double: every text frame a client sends but its heartbeat, with the number of the
+    /// connection it came on; it closes the first connection after its first request.
+    async fn serve() -> (String, mpsc::UnboundedReceiver<(usize, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (sent, requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut number = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                number += 1;
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    let (_write, mut read) = socket.split();
+                    while let Some(Ok(message)) = read.next().await {
+                        if let Message::Text(text) = message
+                            && text != "PING"
+                        {
+                            drop(sent.send((number, text.to_string())));
+                            if number == 1 {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, requests)
+    }
+
+    fn subscribe(subscription: Subscription) -> String {
+        serde_json::to_string(&SubscriptionRequest::subscribe(vec![subscription])).unwrap()
+    }
+
+    /// The handler's task first runs once a reconnect has brought up the second connection
+    /// (PumpAmp V3 bug 0010). That connection still gets the subscriptions.
+    #[test]
+    fn a_handler_that_first_runs_after_a_reconnect_resubscribes() {
+        // The connection runs on its own runtime; the handler's, a current-thread one, runs
+        // nothing until the test drives it.
+        let connection_runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handler_runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let (endpoint, mut requests) = connection_runtime.block_on(serve());
+        let mut config = Config::default();
+        config.reconnect.initial_backoff = Duration::from_millis(50);
+        config.reconnect.max_backoff = Duration::from_millis(50);
+        let connection = {
+            let _entered = connection_runtime.enter();
+            ConnectionManager::new(endpoint, config, SimpleParser).unwrap()
+        };
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone()));
+        {
+            let _entered = handler_runtime.enter();
+            subscriptions.start_reconnection_handler();
+        }
+        let prices = Subscription::crypto_prices(None);
+        let _prices = subscriptions.subscribe(prices.clone()).unwrap();
+
+        // The first connection sends the subscribe and is closed; the second comes up.
+        let next = |requests: &mut mpsc::UnboundedReceiver<(usize, String)>| {
+            connection_runtime.block_on(async {
+                timeout(Duration::from_secs(5), requests.recv())
+                    .await
+                    .expect("the server should receive a request")
+                    .expect("the server should still run")
+            })
+        };
+        assert_eq!(next(&mut requests), (1, subscribe(prices.clone())));
+        connection_runtime.block_on(async {
+            let mut generation = connection.generation_receiver();
+            let mut state = connection.state_receiver();
+            timeout(Duration::from_secs(5), async {
+                generation.wait_for(|generation| generation.0 == 2).await.unwrap();
+                state.wait_for(|state| state.is_connected()).await.unwrap();
+            })
+            .await
+            .expect("the second connection should come up");
+        });
+
+        // The handler's task runs for the first time, then another topic is subscribed.
+        handler_runtime.block_on(async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        let comments = Subscription::comments(None);
+        let _comments = subscriptions.subscribe(comments).unwrap();
+        assert_eq!(
+            next(&mut requests),
+            (2, subscribe(prices)),
+            "the second connection didn't get the subscriptions again first"
+        );
+    }
+}
