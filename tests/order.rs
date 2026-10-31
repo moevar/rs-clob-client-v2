@@ -5331,12 +5331,12 @@ mod poly_v2_position_orders {
     }
 }
 
-/// PumpAmp V3 bug 0020: the venue takes a market buy's USD in whole cents only (`invalid
-/// amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker
-/// amount a max of 4 decimals`, PumpAmp's live orders of 2026-10-31). A market buy signs its USD
-/// rounded down to the cent and, for it, its shares at the price truncated to the tick's amount
-/// decimals, its amount given in USD, in shares or adjusted to the balance; one under a cent
-/// isn't built. Whole-cent buys and a sell are as before.
+/// V3 bug 0020 of moevar/pumpamp-v3: the venue takes a market buy's USD in whole cents only
+/// (`invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals,
+/// taker amount a max of 4 decimals`, the live orders of 2026-10-31). A FOK's or FAK's buy, from
+/// either builder, signs its USD rounded down to the cent and, for it, its shares at the price
+/// truncated to the tick's amount decimals, its amount given in USD, in shares or adjusted to the
+/// balance; one under a cent isn't built. Whole-cent buys, a GTC and a sell are as before.
 mod market_buy_cents {
     use alloy::primitives::b256;
     use httpmock::MockServer;
