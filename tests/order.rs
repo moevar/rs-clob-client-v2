@@ -5330,3 +5330,311 @@ mod poly_v2_position_orders {
         Ok(())
     }
 }
+
+/// V3 bug 0020 of moevar/pumpamp-v3: the venue takes a market buy's USD in whole cents only
+/// (`invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals,
+/// taker amount a max of 4 decimals`, the live orders of 2026-10-31). A FOK's or FAK's buy, from
+/// either builder, signs its USD rounded down to the cent and, for it, its shares at the price
+/// truncated to the tick's amount decimals, its amount given in USD, in shares or adjusted to the
+/// balance; one under a cent isn't built. Whole-cent buys, a GTC and a sell are as before.
+mod market_buy_cents {
+    use alloy::primitives::b256;
+    use httpmock::MockServer;
+    use polymarket_client_sdk_v2::clob::types::{Amount, OrderType, Side, SignableOrder, TickSize};
+    use polymarket_client_sdk_v2::error::Validation;
+    use polymarket_client_sdk_v2::types::Decimal;
+    use reqwest::StatusCode;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    use crate::common::{create_authenticated, ensure_requirements, token_1, token_2};
+
+    /// A build's maker and taker amounts in millionths, or its error: a validation error's reason
+    /// (review 1 of the fix: no other error passes for a refusal).
+    fn outcome(
+        built: polymarket_client_sdk_v2::Result<SignableOrder>,
+    ) -> Result<(u128, u128), String> {
+        match built {
+            Ok(order) => {
+                let order = order.order();
+                Ok((
+                    order.makerAmount.to::<u128>(),
+                    order.takerAmount.to::<u128>(),
+                ))
+            }
+            Err(error) => Err(error.downcast_ref::<Validation>().map_or_else(
+                || format!("not a validation error: {error}"),
+                |validation| validation.reason.clone(),
+            )),
+        }
+    }
+
+    /// The validation error of a FOK's or FAK's buy of `usd` under a cent.
+    fn under_a_cent(usd: &str) -> Result<(u128, u128), String> {
+        Err(format!(
+            "Unable to build Order: a FOK or FAK buy's amount {usd} is under a cent"
+        ))
+    }
+
+    /// The market's fee details, for a buy adjusted to the balance: a rate of 0.07, exponent 1.
+    fn fees(server: &MockServer) {
+        let condition =
+            b256!("4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee").to_string();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/markets-by-token/{}", token_1()));
+            then.status(StatusCode::OK).json_body(json!({
+                "condition_id": condition,
+                "primary_token_id": token_1().to_string(),
+                "secondary_token_id": token_2().to_string(),
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/clob-markets/{condition}"));
+            then.status(StatusCode::OK).json_body(json!({
+                "gst": "2026-10-31T19:30:00Z",
+                "r": { "moas": 4 },
+                "t": [
+                    { "t": token_1().to_string(), "o": "Up" },
+                    { "t": token_2().to_string(), "o": "Down" }
+                ],
+                "c": condition,
+                "sd": 3,
+                "mos": 5,
+                "mts": 0.01,
+                "mbf": 1000,
+                "tbf": 1000,
+                "cbos": true,
+                "aot": "2026-10-31T19:25:00Z",
+                "ibce": true,
+                "fd": { "r": 0.07, "e": 1, "to": true }
+            }));
+        });
+    }
+
+    /// An order of `kind` from the market builder, of `side` for `amount` at `price`, adjusted to
+    /// `balance` if given, built at `tick`: its [`outcome`].
+    async fn signed(
+        tick: TickSize,
+        (kind, side, amount, price): (OrderType, Side, Amount, Decimal),
+        balance: Option<Decimal>,
+    ) -> anyhow::Result<Result<(u128, u128), String>> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        ensure_requirements(&server, token_1(), tick);
+        fees(&server);
+        let mut builder = client
+            .market_order()
+            .token_id(token_1())
+            .amount(amount)
+            .side(side)
+            .price(price)
+            .order_type(kind);
+        if let Some(balance) = balance {
+            builder = builder.user_usdc_balance(balance);
+        }
+        Ok(outcome(builder.build().await))
+    }
+
+    /// The market builder's FOK and FAK buys (its default a FAK, review 3); it takes a GTC with a
+    /// given price, which keeps the limit rule (review 2).
+    #[tokio::test]
+    async fn a_market_buy_signs_its_usd_in_whole_cents() -> anyhow::Result<()> {
+        use OrderType::{FAK, FOK, GTC};
+        use Side::{Buy, Sell};
+        use TickSize::{Hundredth, Thousandth};
+        let (usd, shares) = (Amount::usdc, Amount::shares);
+        let cases = [
+            (
+                "$1.0035 of a buy at 0.45",
+                Hundredth,
+                (FOK, Buy, usd(dec!(1.0035))?, dec!(0.45)),
+                None,
+                Ok((1_000_000, 2_222_200)),
+            ),
+            (
+                "2.23 shares of a buy at 0.45",
+                Hundredth,
+                (FOK, Buy, shares(dec!(2.23))?, dec!(0.45)),
+                None,
+                Ok((1_000_000, 2_222_200)),
+            ),
+            (
+                "1.13 shares of a buy at 0.89",
+                Hundredth,
+                (FOK, Buy, shares(dec!(1.13))?, dec!(0.89)),
+                None,
+                Ok((1_000_000, 1_123_500)),
+            ),
+            (
+                "$1.0057 of a buy at 0.89",
+                Hundredth,
+                (FOK, Buy, usd(dec!(1.0057))?, dec!(0.89)),
+                None,
+                Ok((1_000_000, 1_123_500)),
+            ),
+            (
+                "$1.0057 of a FAK buy at 0.89",
+                Hundredth,
+                (FAK, Buy, usd(dec!(1.0057))?, dec!(0.89)),
+                None,
+                Ok((1_000_000, 1_123_500)),
+            ),
+            (
+                "4 shares of a buy at 0.333, a tick of 0.001",
+                Thousandth,
+                (FOK, Buy, shares(dec!(4))?, dec!(0.333)),
+                None,
+                Ok((1_330_000, 3_993_990)),
+            ),
+            (
+                "$1 of a buy at 0.45 adjusted to a balance of $1",
+                Hundredth,
+                (FOK, Buy, usd(dec!(1))?, dec!(0.45)),
+                Some(dec!(1)),
+                Ok((960_000, 2_133_300)),
+            ),
+            (
+                "$0.004 of a buy at 0.45",
+                Hundredth,
+                (FOK, Buy, usd(dec!(0.004))?, dec!(0.45)),
+                None,
+                under_a_cent("0.004"),
+            ),
+            (
+                "0.01 shares of a buy at 0.45",
+                Hundredth,
+                (FOK, Buy, shares(dec!(0.01))?, dec!(0.45)),
+                None,
+                under_a_cent("0.0045"),
+            ),
+            (
+                "$100 of a buy at 0.5, as before",
+                Hundredth,
+                (FOK, Buy, usd(dec!(100))?, dec!(0.5)),
+                None,
+                Ok((100_000_000, 200_000_000)),
+            ),
+            (
+                "250 shares of a buy at 0.4, as before",
+                Hundredth,
+                (FOK, Buy, shares(dec!(250))?, dec!(0.4)),
+                None,
+                Ok((100_000_000, 250_000_000)),
+            ),
+            (
+                "5.23 shares of a GTC buy at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, shares(dec!(5.23))?, dec!(0.45)),
+                None,
+                Ok((2_353_500, 5_230_000)),
+            ),
+            (
+                "$1.0035 of a GTC buy at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, usd(dec!(1.0035))?, dec!(0.45)),
+                None,
+                Ok((1_003_500, 2_230_000)),
+            ),
+            (
+                "2.23 shares of a sell at 0.45, as before",
+                Hundredth,
+                (FOK, Sell, shares(dec!(2.23))?, dec!(0.45)),
+                None,
+                Ok((2_230_000, 1_003_500)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (case, tick, order, balance, expected) in cases {
+            let found = signed(tick, order, balance).await?;
+            if found != expected {
+                wrong.push(format!(
+                    "{case}: (maker, taker) {found:?}, not {expected:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+
+    /// An order of `kind` from the limit builder, of `side` for `size` at `price`, built at
+    /// `tick`: its [`outcome`].
+    async fn limit_signed(
+        tick: TickSize,
+        (kind, side, size, price): (OrderType, Side, Decimal, Decimal),
+    ) -> anyhow::Result<Result<(u128, u128), String>> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        ensure_requirements(&server, token_1(), tick);
+        let built = client
+            .limit_order()
+            .token_id(token_1())
+            .size(size)
+            .price(price)
+            .side(side)
+            .order_type(kind)
+            .build()
+            .await;
+        Ok(outcome(built))
+    }
+
+    /// The limit builder takes a FOK or FAK, which the venue holds to a market order's amounts:
+    /// its buy signs the same whole cents. A resting buy and a sell keep the limit rule.
+    #[tokio::test]
+    async fn a_fok_or_fak_buy_from_the_limit_builder_signs_its_usd_in_whole_cents()
+    -> anyhow::Result<()> {
+        use OrderType::{FAK, FOK, GTC};
+        use Side::{Buy, Sell};
+        use TickSize::{Hundredth, Thousandth};
+        let cases = [
+            (
+                "a FOK buy of 2.23 at 0.45",
+                Hundredth,
+                (FOK, Buy, dec!(2.23), dec!(0.45)),
+                Ok((1_000_000, 2_222_200)),
+            ),
+            (
+                "a FAK buy of 1.13 at 0.89",
+                Hundredth,
+                (FAK, Buy, dec!(1.13), dec!(0.89)),
+                Ok((1_000_000, 1_123_500)),
+            ),
+            (
+                "a FOK buy of 4 at 0.333, a tick of 0.001",
+                Thousandth,
+                (FOK, Buy, dec!(4), dec!(0.333)),
+                Ok((1_330_000, 3_993_990)),
+            ),
+            (
+                "a FOK buy of 0.01 at 0.45",
+                Hundredth,
+                (FOK, Buy, dec!(0.01), dec!(0.45)),
+                under_a_cent("0.0045"),
+            ),
+            (
+                "a GTC buy of 2.23 at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, dec!(2.23), dec!(0.45)),
+                Ok((1_003_500, 2_230_000)),
+            ),
+            (
+                "a FOK sell of 2.23 at 0.45, as before",
+                Hundredth,
+                (FOK, Sell, dec!(2.23), dec!(0.45)),
+                Ok((2_230_000, 1_003_500)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (case, tick, order, expected) in cases {
+            let found = limit_signed(tick, order).await?;
+            if found != expected {
+                wrong.push(format!(
+                    "{case}: (maker, taker) {found:?}, not {expected:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+}

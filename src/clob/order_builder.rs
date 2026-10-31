@@ -24,6 +24,10 @@ use crate::types::{Address, Decimal};
 /// Maximum number of decimal places for `size`
 pub(crate) const LOT_SIZE_SCALE: u32 = 2;
 
+/// Maximum number of decimal places for a FOK's or FAK's buy's USD amount: the venue takes a
+/// market buy's USD in whole cents only.
+const MARKET_BUY_USD_SCALE: u32 = 2;
+
 /// Placeholder type for compile-time checks on limit order builders
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -382,6 +386,11 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         }
 
         let (taker_amount, maker_amount) = match side {
+            // The venue holds a FOK's or FAK's buy to a market order's amounts.
+            Side::Buy if matches!(order_type, OrderType::FOK | OrderType::FAK) => {
+                let (usd, shares) = market_buy_amounts(size * price, price, decimals)?;
+                (shares, usd)
+            }
             Side::Buy => (
                 size,
                 (size * price).trunc_with_scale(decimals + LOT_SIZE_SCALE),
@@ -634,7 +643,18 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
 
         let raw_amount = amount.as_inner();
 
+        // A GTC or GTD given a price keeps the limit rule; a FOK's or FAK's buy is signed in whole
+        // cents, whether given in USD, in shares or adjusted to the balance.
+        let market = matches!(order_type, OrderType::FOK | OrderType::FAK);
         let (taker_amount, maker_amount) = match (side, amount.0) {
+            (Side::Buy, AmountInner::Usdc(_)) if market => {
+                let (usd, shares) = market_buy_amounts(raw_amount, price, decimals)?;
+                (shares, usd)
+            }
+            (Side::Buy, AmountInner::Shares(_)) if market => {
+                let (usd, shares) = market_buy_amounts(raw_amount * price, price, decimals)?;
+                (shares, usd)
+            }
             (Side::Buy, AmountInner::Usdc(_)) => {
                 let shares = (raw_amount / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
                 (shares, raw_amount)
@@ -713,6 +733,21 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         }
         result
     }
+}
+
+/// A FOK's or FAK's buy, which the venue holds to a market order's amounts: its `usd` rounded
+/// down to the cent, and that amount ÷ `price` in shares truncated to the amount decimals (the
+/// tick's `decimals` plus the lot's). Returns `(usd, shares)`, or an error when `usd` is under a
+/// cent.
+fn market_buy_amounts(usd: Decimal, price: Decimal, decimals: u32) -> Result<(Decimal, Decimal)> {
+    let cents = usd.trunc_with_scale(MARKET_BUY_USD_SCALE);
+    if cents <= Decimal::ZERO {
+        return Err(Error::validation(format!(
+            "Unable to build Order: a FOK or FAK buy's amount {usd} is under a cent"
+        )));
+    }
+    let shares = (cents / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+    Ok((cents, shares))
 }
 
 /// Removes trailing zeros, truncates to [`USDC_DECIMALS`] decimal places, and quanitizes as an
