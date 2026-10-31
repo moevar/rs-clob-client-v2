@@ -5330,3 +5330,178 @@ mod poly_v2_position_orders {
         Ok(())
     }
 }
+
+/// PumpAmp V3 bug 0020: the venue takes a market buy's USD in whole cents only (`invalid
+/// amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker
+/// amount a max of 4 decimals`, PumpAmp's live orders of 2026-10-31). A market buy signs its USD
+/// rounded down to the cent and, for it, its shares at the price truncated to the tick's amount
+/// decimals, its amount given in USD, in shares or adjusted to the balance; one under a cent
+/// isn't built. Whole-cent buys and a sell are as before.
+mod market_buy_cents {
+    use alloy::primitives::b256;
+    use httpmock::MockServer;
+    use polymarket_client_sdk_v2::clob::types::{Amount, OrderType, Side, TickSize};
+    use polymarket_client_sdk_v2::types::Decimal;
+    use reqwest::StatusCode;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    use crate::common::{create_authenticated, ensure_requirements, token_1, token_2};
+
+    /// The market's fee details, for a buy adjusted to the balance: a rate of 0.07, exponent 1.
+    fn fees(server: &MockServer) {
+        let condition =
+            b256!("4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee").to_string();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/markets-by-token/{}", token_1()));
+            then.status(StatusCode::OK).json_body(json!({
+                "condition_id": condition,
+                "primary_token_id": token_1().to_string(),
+                "secondary_token_id": token_2().to_string(),
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/clob-markets/{condition}"));
+            then.status(StatusCode::OK).json_body(json!({
+                "gst": "2026-10-31T19:30:00Z",
+                "r": { "moas": 4 },
+                "t": [
+                    { "t": token_1().to_string(), "o": "Up" },
+                    { "t": token_2().to_string(), "o": "Down" }
+                ],
+                "c": condition,
+                "sd": 3,
+                "mos": 5,
+                "mts": 0.01,
+                "mbf": 1000,
+                "tbf": 1000,
+                "cbos": true,
+                "aot": "2026-10-31T19:25:00Z",
+                "ibce": true,
+                "fd": { "r": 0.07, "e": 1, "to": true }
+            }));
+        });
+    }
+
+    /// A FOK of `side` for `amount` at `price`, adjusted to `balance` if given, built at `tick`:
+    /// its maker and taker amounts in millionths, or none when it isn't built.
+    async fn signed(
+        tick: TickSize,
+        (side, amount, price): (Side, Amount, Decimal),
+        balance: Option<Decimal>,
+    ) -> anyhow::Result<Option<(u128, u128)>> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        ensure_requirements(&server, token_1(), tick);
+        fees(&server);
+        let mut builder = client
+            .market_order()
+            .token_id(token_1())
+            .amount(amount)
+            .side(side)
+            .price(price)
+            .order_type(OrderType::FOK);
+        if let Some(balance) = balance {
+            builder = builder.user_usdc_balance(balance);
+        }
+        Ok(builder.build().await.ok().map(|order| {
+            let order = order.order();
+            (
+                order.makerAmount.to::<u128>(),
+                order.takerAmount.to::<u128>(),
+            )
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_market_buy_signs_its_usd_in_whole_cents() -> anyhow::Result<()> {
+        use Side::{Buy, Sell};
+        use TickSize::{Hundredth, Thousandth};
+        let (usd, shares) = (Amount::usdc, Amount::shares);
+        let cases = [
+            (
+                "$1.0035 of a buy at 0.45",
+                Hundredth,
+                (Buy, usd(dec!(1.0035))?, dec!(0.45)),
+                None,
+                Some((1_000_000, 2_222_200)),
+            ),
+            (
+                "2.23 shares of a buy at 0.45",
+                Hundredth,
+                (Buy, shares(dec!(2.23))?, dec!(0.45)),
+                None,
+                Some((1_000_000, 2_222_200)),
+            ),
+            (
+                "1.13 shares of a buy at 0.89",
+                Hundredth,
+                (Buy, shares(dec!(1.13))?, dec!(0.89)),
+                None,
+                Some((1_000_000, 1_123_500)),
+            ),
+            (
+                "4 shares of a buy at 0.333, a tick of 0.001",
+                Thousandth,
+                (Buy, shares(dec!(4))?, dec!(0.333)),
+                None,
+                Some((1_330_000, 3_993_990)),
+            ),
+            (
+                "$1 of a buy at 0.45 adjusted to a balance of $1",
+                Hundredth,
+                (Buy, usd(dec!(1))?, dec!(0.45)),
+                Some(dec!(1)),
+                Some((960_000, 2_133_300)),
+            ),
+            (
+                "$0.004 of a buy at 0.45",
+                Hundredth,
+                (Buy, usd(dec!(0.004))?, dec!(0.45)),
+                None,
+                None,
+            ),
+            (
+                "0.01 shares of a buy at 0.45",
+                Hundredth,
+                (Buy, shares(dec!(0.01))?, dec!(0.45)),
+                None,
+                None,
+            ),
+            (
+                "$100 of a buy at 0.5, as before",
+                Hundredth,
+                (Buy, usd(dec!(100))?, dec!(0.5)),
+                None,
+                Some((100_000_000, 200_000_000)),
+            ),
+            (
+                "250 shares of a buy at 0.4, as before",
+                Hundredth,
+                (Buy, shares(dec!(250))?, dec!(0.4)),
+                None,
+                Some((100_000_000, 250_000_000)),
+            ),
+            (
+                "2.23 shares of a sell at 0.45, as before",
+                Hundredth,
+                (Sell, shares(dec!(2.23))?, dec!(0.45)),
+                None,
+                Some((2_230_000, 1_003_500)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (case, tick, order, balance, expected) in cases {
+            let found = signed(tick, order, balance).await?;
+            if found != expected {
+                wrong.push(format!(
+                    "{case}: (maker, taker) {found:?}, not {expected:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+}
