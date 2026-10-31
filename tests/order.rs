@@ -5416,11 +5416,11 @@ mod market_buy_cents {
         }))
     }
 
-    /// The market builder's FOK and FAK buys; it takes a GTC with a given price, which keeps the
-    /// limit rule (review 2).
+    /// The market builder's FOK and FAK buys (its default a FAK, review 3); it takes a GTC with a
+    /// given price, which keeps the limit rule (review 2).
     #[tokio::test]
     async fn a_market_buy_signs_its_usd_in_whole_cents() -> anyhow::Result<()> {
-        use OrderType::{FOK, GTC};
+        use OrderType::{FAK, FOK, GTC};
         use Side::{Buy, Sell};
         use TickSize::{Hundredth, Thousandth};
         let (usd, shares) = (Amount::usdc, Amount::shares);
@@ -5450,6 +5450,13 @@ mod market_buy_cents {
                 "$1.0057 of a buy at 0.89",
                 Hundredth,
                 (FOK, Buy, usd(dec!(1.0057))?, dec!(0.89)),
+                None,
+                Some((1_000_000, 1_123_500)),
+            ),
+            (
+                "$1.0057 of a FAK buy at 0.89",
+                Hundredth,
+                (FAK, Buy, usd(dec!(1.0057))?, dec!(0.89)),
                 None,
                 Some((1_000_000, 1_123_500)),
             ),
