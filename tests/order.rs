@@ -5385,11 +5385,12 @@ mod market_buy_cents {
         });
     }
 
-    /// A FOK of `side` for `amount` at `price`, adjusted to `balance` if given, built at `tick`:
-    /// its maker and taker amounts in millionths, or none when it isn't built.
+    /// An order of `kind` from the market builder, of `side` for `amount` at `price`, adjusted to
+    /// `balance` if given, built at `tick`: its maker and taker amounts in millionths, or none
+    /// when it isn't built.
     async fn signed(
         tick: TickSize,
-        (side, amount, price): (Side, Amount, Decimal),
+        (kind, side, amount, price): (OrderType, Side, Amount, Decimal),
         balance: Option<Decimal>,
     ) -> anyhow::Result<Option<(u128, u128)>> {
         let server = MockServer::start();
@@ -5402,7 +5403,7 @@ mod market_buy_cents {
             .amount(amount)
             .side(side)
             .price(price)
-            .order_type(OrderType::FOK);
+            .order_type(kind);
         if let Some(balance) = balance {
             builder = builder.user_usdc_balance(balance);
         }
@@ -5415,8 +5416,11 @@ mod market_buy_cents {
         }))
     }
 
+    /// The market builder's FOK and FAK buys; it takes a GTC with a given price, which keeps the
+    /// limit rule (review 2).
     #[tokio::test]
     async fn a_market_buy_signs_its_usd_in_whole_cents() -> anyhow::Result<()> {
+        use OrderType::{FOK, GTC};
         use Side::{Buy, Sell};
         use TickSize::{Hundredth, Thousandth};
         let (usd, shares) = (Amount::usdc, Amount::shares);
@@ -5424,77 +5428,91 @@ mod market_buy_cents {
             (
                 "$1.0035 of a buy at 0.45",
                 Hundredth,
-                (Buy, usd(dec!(1.0035))?, dec!(0.45)),
+                (FOK, Buy, usd(dec!(1.0035))?, dec!(0.45)),
                 None,
                 Some((1_000_000, 2_222_200)),
             ),
             (
                 "2.23 shares of a buy at 0.45",
                 Hundredth,
-                (Buy, shares(dec!(2.23))?, dec!(0.45)),
+                (FOK, Buy, shares(dec!(2.23))?, dec!(0.45)),
                 None,
                 Some((1_000_000, 2_222_200)),
             ),
             (
                 "1.13 shares of a buy at 0.89",
                 Hundredth,
-                (Buy, shares(dec!(1.13))?, dec!(0.89)),
+                (FOK, Buy, shares(dec!(1.13))?, dec!(0.89)),
                 None,
                 Some((1_000_000, 1_123_500)),
             ),
             (
                 "$1.0057 of a buy at 0.89",
                 Hundredth,
-                (Buy, usd(dec!(1.0057))?, dec!(0.89)),
+                (FOK, Buy, usd(dec!(1.0057))?, dec!(0.89)),
                 None,
                 Some((1_000_000, 1_123_500)),
             ),
             (
                 "4 shares of a buy at 0.333, a tick of 0.001",
                 Thousandth,
-                (Buy, shares(dec!(4))?, dec!(0.333)),
+                (FOK, Buy, shares(dec!(4))?, dec!(0.333)),
                 None,
                 Some((1_330_000, 3_993_990)),
             ),
             (
                 "$1 of a buy at 0.45 adjusted to a balance of $1",
                 Hundredth,
-                (Buy, usd(dec!(1))?, dec!(0.45)),
+                (FOK, Buy, usd(dec!(1))?, dec!(0.45)),
                 Some(dec!(1)),
                 Some((960_000, 2_133_300)),
             ),
             (
                 "$0.004 of a buy at 0.45",
                 Hundredth,
-                (Buy, usd(dec!(0.004))?, dec!(0.45)),
+                (FOK, Buy, usd(dec!(0.004))?, dec!(0.45)),
                 None,
                 None,
             ),
             (
                 "0.01 shares of a buy at 0.45",
                 Hundredth,
-                (Buy, shares(dec!(0.01))?, dec!(0.45)),
+                (FOK, Buy, shares(dec!(0.01))?, dec!(0.45)),
                 None,
                 None,
             ),
             (
                 "$100 of a buy at 0.5, as before",
                 Hundredth,
-                (Buy, usd(dec!(100))?, dec!(0.5)),
+                (FOK, Buy, usd(dec!(100))?, dec!(0.5)),
                 None,
                 Some((100_000_000, 200_000_000)),
             ),
             (
                 "250 shares of a buy at 0.4, as before",
                 Hundredth,
-                (Buy, shares(dec!(250))?, dec!(0.4)),
+                (FOK, Buy, shares(dec!(250))?, dec!(0.4)),
                 None,
                 Some((100_000_000, 250_000_000)),
             ),
             (
+                "5.23 shares of a GTC buy at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, shares(dec!(5.23))?, dec!(0.45)),
+                None,
+                Some((2_353_500, 5_230_000)),
+            ),
+            (
+                "$1.0035 of a GTC buy at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, usd(dec!(1.0035))?, dec!(0.45)),
+                None,
+                Some((1_003_500, 2_230_000)),
+            ),
+            (
                 "2.23 shares of a sell at 0.45, as before",
                 Hundredth,
-                (Sell, shares(dec!(2.23))?, dec!(0.45)),
+                (FOK, Sell, shares(dec!(2.23))?, dec!(0.45)),
                 None,
                 Some((2_230_000, 1_003_500)),
             ),
