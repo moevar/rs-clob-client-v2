@@ -5443,6 +5443,13 @@ mod market_buy_cents {
                 Some((1_000_000, 1_123_500)),
             ),
             (
+                "$1.0057 of a buy at 0.89",
+                Hundredth,
+                (Buy, usd(dec!(1.0057))?, dec!(0.89)),
+                None,
+                Some((1_000_000, 1_123_500)),
+            ),
+            (
                 "4 shares of a buy at 0.333, a tick of 0.001",
                 Thousandth,
                 (Buy, shares(dec!(4))?, dec!(0.333)),
@@ -5495,6 +5502,92 @@ mod market_buy_cents {
         let mut wrong = Vec::new();
         for (case, tick, order, balance, expected) in cases {
             let found = signed(tick, order, balance).await?;
+            if found != expected {
+                wrong.push(format!(
+                    "{case}: (maker, taker) {found:?}, not {expected:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+
+    /// An order of `kind` from the limit builder, of `side` for `size` at `price`, built at
+    /// `tick`: its maker and taker amounts in millionths, or none when it isn't built.
+    async fn limit_signed(
+        tick: TickSize,
+        (kind, side, size, price): (OrderType, Side, Decimal, Decimal),
+    ) -> anyhow::Result<Option<(u128, u128)>> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+        ensure_requirements(&server, token_1(), tick);
+        let built = client
+            .limit_order()
+            .token_id(token_1())
+            .size(size)
+            .price(price)
+            .side(side)
+            .order_type(kind)
+            .build()
+            .await;
+        Ok(built.ok().map(|order| {
+            let order = order.order();
+            (
+                order.makerAmount.to::<u128>(),
+                order.takerAmount.to::<u128>(),
+            )
+        }))
+    }
+
+    /// The limit builder takes a FOK or FAK, which the venue holds to a market order's amounts:
+    /// its buy signs the same whole cents. A resting buy and a sell keep the limit rule.
+    #[tokio::test]
+    async fn a_fok_or_fak_buy_from_the_limit_builder_signs_its_usd_in_whole_cents()
+    -> anyhow::Result<()> {
+        use OrderType::{FAK, FOK, GTC};
+        use Side::{Buy, Sell};
+        use TickSize::{Hundredth, Thousandth};
+        let cases = [
+            (
+                "a FOK buy of 2.23 at 0.45",
+                Hundredth,
+                (FOK, Buy, dec!(2.23), dec!(0.45)),
+                Some((1_000_000, 2_222_200)),
+            ),
+            (
+                "a FAK buy of 1.13 at 0.89",
+                Hundredth,
+                (FAK, Buy, dec!(1.13), dec!(0.89)),
+                Some((1_000_000, 1_123_500)),
+            ),
+            (
+                "a FOK buy of 4 at 0.333, a tick of 0.001",
+                Thousandth,
+                (FOK, Buy, dec!(4), dec!(0.333)),
+                Some((1_330_000, 3_993_990)),
+            ),
+            (
+                "a FOK buy of 0.01 at 0.45",
+                Hundredth,
+                (FOK, Buy, dec!(0.01), dec!(0.45)),
+                None,
+            ),
+            (
+                "a GTC buy of 2.23 at 0.45, as before",
+                Hundredth,
+                (GTC, Buy, dec!(2.23), dec!(0.45)),
+                Some((1_003_500, 2_230_000)),
+            ),
+            (
+                "a FOK sell of 2.23 at 0.45, as before",
+                Hundredth,
+                (FOK, Sell, dec!(2.23), dec!(0.45)),
+                Some((2_230_000, 1_003_500)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (case, tick, order, expected) in cases {
+            let found = limit_signed(tick, order).await?;
             if found != expected {
                 wrong.push(format!(
                     "{case}: (maker, taker) {found:?}, not {expected:?}"
