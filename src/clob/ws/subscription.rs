@@ -791,17 +791,23 @@ impl SubscriptionManager {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::str::FromStr as _;
     use std::thread;
     use std::time::Duration;
 
+    use futures::{FutureExt as _, StreamExt as _};
     use serde_json::json;
     use tokio::runtime::{Builder, Runtime};
+    use tokio::sync::{broadcast, mpsc};
     use uuid::Uuid;
 
     use super::*;
+    use crate::ws::ConnectionDiagnostic;
     use crate::ws::config::Config;
-    use crate::ws::test_venue::{answering, first, within};
+    use crate::ws::test_support::{
+        HeldWrite, answering, first, gate_the_second, wait_until, within,
+    };
 
     const ASSET: &str =
         "65818619657568813474341868652308942079804919287380422192892211131408793125422";
@@ -969,6 +975,170 @@ mod tests {
         assert_eq!(
             order.id, "answer",
             "the user stream missed the answer to its subscribe"
+        );
+    }
+
+    type RawStream = Pin<Box<dyn Stream<Item = Result<MarketRawStreamEvent>>>>;
+
+    /// A raw market stream, as V3 reads it, whose venue has closed its first connection: in the
+    /// backoff, one write has gone at once and a second is held after its read of the state. The
+    /// runtime is a current-thread one, run only while a test drives it, so the connection stays
+    /// `Reconnecting` until a test drives it again; the venue answers the second connection's
+    /// handshake once `handshake` is given `()`.
+    struct Backoff {
+        runtime: Runtime,
+        connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        _subscriptions: Arc<SubscriptionManager>,
+        stream: RawStream,
+        handshake: mpsc::UnboundedSender<()>,
+        held: HeldWrite,
+    }
+
+    fn backoff() -> Backoff {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let (endpoint, handshake) = runtime.block_on(gate_the_second());
+        let mut config = Config::default();
+        config.reconnect.initial_backoff = Duration::from_secs(1);
+        config.reconnect.max_backoff = Duration::from_secs(1);
+        let interest = Arc::new(InterestTracker::new());
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::new(endpoint, config, Arc::clone(&interest)).unwrap()
+        };
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone(), interest));
+        let asset = U256::from_str(ASSET).unwrap();
+        let stream: RawStream = Box::pin(
+            subscriptions
+                .subscribe_market_raw_events(vec![asset])
+                .unwrap(),
+        );
+        let mut state = connection.state_receiver();
+        within(&runtime, "connection 1 should go down", async {
+            state
+                .wait_for(|state| matches!(state, ConnectionState::Reconnecting { .. }))
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        connection.send(&"at once").unwrap();
+        let held = {
+            let connection = connection.clone();
+            HeldWrite::start(move || connection.send(&"held").unwrap())
+        };
+        Backoff {
+            runtime,
+            connection,
+            _subscriptions: subscriptions,
+            stream,
+            handshake,
+            held,
+        }
+    }
+
+    async fn connected(diagnostics: &mut broadcast::Receiver<ConnectionDiagnostic>, number: u64) {
+        loop {
+            let diagnostic = diagnostics.recv().await.unwrap();
+            if diagnostic.kind == ConnectionDiagnosticKind::Connected
+                && diagnostic.generation == ConnectionGeneration(number)
+            {
+                return;
+            }
+        }
+    }
+
+    /// The raw stream's `Connected` and `WriteFailed` so far, in order, with their generation.
+    fn connections_and_failed_writes(stream: &mut RawStream) -> Vec<(&'static str, u64)> {
+        let mut seen = Vec::new();
+        while let Some(Some(event)) = stream.next().now_or_never() {
+            if let MarketRawStreamEvent::Continuity { generation, reason } = event.unwrap() {
+                match reason {
+                    MarketStreamContinuity::Connected => seen.push(("connected", generation.0)),
+                    MarketStreamContinuity::WriteFailed => {
+                        seen.push(("write_failed", generation.0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        seen
+    }
+
+    /// The held write goes on once connection 2 is up, its `Connected` out. Both writes failed
+    /// while connection 1 was down.
+    #[test]
+    fn a_write_held_past_the_next_connected_names_the_connection_that_was_down() {
+        let mut backoff = backoff();
+        let mut diagnostics = backoff.connection.subscribe_diagnostics();
+        backoff.handshake.send(()).unwrap();
+        within(
+            &backoff.runtime,
+            "connection 2 should come up",
+            connected(&mut diagnostics, 2),
+        );
+        assert!(backoff.held.release(), "the held write should return");
+        assert_eq!(
+            connections_and_failed_writes(&mut backoff.stream),
+            [
+                ("connected", 1),
+                ("write_failed", 1),
+                ("connected", 2),
+                ("write_failed", 1),
+            ],
+            "the write at once and the held one both failed while connection 1 was down"
+        );
+    }
+
+    /// The held write goes on once connection 2 has published its generation, its `Connected`
+    /// held back: the test borrows the state, which the connection sets to `Connected` next. Both
+    /// writes failed while connection 1 was down.
+    #[test]
+    fn a_write_held_until_the_next_generation_names_the_connection_that_was_down() {
+        let mut backoff = backoff();
+        let mut diagnostics = backoff.connection.subscribe_diagnostics();
+        let mut state = backoff.connection.state_receiver();
+        // The venue holds connection 2's handshake, so the connection stops in `Connecting`.
+        let connecting = within(
+            &backoff.runtime,
+            "connection 2 should be opened",
+            state.wait_for(|state| matches!(state, ConnectionState::Connecting)),
+        )
+        .unwrap();
+        let (published, returned) = thread::scope(|scope| {
+            let Backoff {
+                runtime,
+                connection,
+                handshake,
+                held,
+                ..
+            } = &backoff;
+            let driver = scope.spawn(move || {
+                handshake.send(()).unwrap();
+                within(
+                    runtime,
+                    "connection 2 should come up",
+                    connected(&mut diagnostics, 2),
+                );
+            });
+            let published = wait_until(|| connection.generation() == ConnectionGeneration(2));
+            let returned = published && held.release();
+            drop(connecting);
+            driver.join().unwrap();
+            (published, returned)
+        });
+        assert!(published, "connection 2 should publish its generation");
+        assert!(
+            returned,
+            "the held write should return while `Connected` waits"
+        );
+        assert_eq!(
+            connections_and_failed_writes(&mut backoff.stream),
+            [
+                ("connected", 1),
+                ("write_failed", 1),
+                ("write_failed", 1),
+                ("connected", 2),
+            ],
+            "the write at once and the held one both failed while connection 1 was down"
         );
     }
 }

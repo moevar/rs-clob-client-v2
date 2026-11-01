@@ -24,7 +24,7 @@ pub mod connection;
 pub mod error;
 pub mod raw_event;
 #[cfg(test)]
-pub(crate) mod test_venue;
+pub(crate) mod test_support;
 pub mod traits;
 
 pub use connection::{

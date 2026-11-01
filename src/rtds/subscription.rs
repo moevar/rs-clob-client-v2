@@ -348,7 +348,7 @@ mod tests {
 
     use super::*;
     use crate::ws::config::Config;
-    use crate::ws::test_venue::{answering, first, within};
+    use crate::ws::test_support::{answering, first, within};
 
     /// An RTDS double: every text frame a client sends but its heartbeat, with the number of the
     /// connection it came on; it closes the first connection after its first request.
