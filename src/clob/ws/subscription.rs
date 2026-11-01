@@ -334,9 +334,9 @@ impl SubscriptionManager {
         asset_ids: Vec<U256>,
         custom_features: bool,
     ) -> Result<impl Stream<Item = Result<WsMessage>> + use<>> {
-        let asset_ids_set = self.register_market_subscription(asset_ids, custom_features)?;
-
+        // The receiver before the request, so the stream gets the venue's answer to it.
         let mut rx = self.connection.subscribe();
+        let asset_ids_set = self.register_market_subscription(asset_ids, custom_features)?;
 
         Ok(try_stream! {
             loop {
@@ -557,6 +557,9 @@ impl SubscriptionManager {
             return Err(WsError::ConnectionClosed.into());
         }
 
+        // The receiver before the request, so the stream gets the venue's answer to it.
+        let mut rx = self.connection.subscribe();
+
         self.interest.add(MessageInterest::USER);
 
         // Store auth for re-subscription on reconnect.
@@ -612,9 +615,6 @@ impl SubscriptionManager {
                 created_at: Instant::now(),
             },
         );
-
-        // Create stream for user messages
-        let mut rx = self.connection.subscribe();
 
         Ok(try_stream! {
             loop {
@@ -786,5 +786,359 @@ impl SubscriptionManager {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::str::FromStr as _;
+    use std::thread;
+    use std::time::Duration;
+
+    use futures::{FutureExt as _, StreamExt as _};
+    use serde_json::json;
+    use tokio::runtime::{Builder, Runtime};
+    use tokio::sync::{broadcast, mpsc};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::ws::ConnectionDiagnostic;
+    use crate::ws::config::Config;
+    use crate::ws::test_support::{
+        HeldWrite, answering, first, gate_the_second, wait_until, within,
+    };
+
+    const ASSET: &str =
+        "65818619657568813474341868652308942079804919287380422192892211131408793125422";
+    const MARKET: &str = "0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84af";
+
+    fn book(hash: &str) -> String {
+        json!({
+            "event_type": "book",
+            "asset_id": ASSET,
+            "market": MARKET,
+            "bids": [{ "price": ".48", "size": "30" }],
+            "asks": [{ "price": ".52", "size": "25" }],
+            "timestamp": "123456789000",
+            "hash": hash,
+        })
+        .to_string()
+    }
+
+    fn order(id: &str) -> String {
+        json!({
+            "event_type": "order",
+            "id": id,
+            "asset_id": ASSET,
+            "market": MARKET,
+            "owner": "9180014b-33c8-9240-a14b-bdca11c0a465",
+            "original_size": "10",
+            "outcome": "YES",
+            "price": "0.57",
+            "side": "SELL",
+            "size_matched": "0",
+            "status": "LIVE",
+            "timestamp": "1672290687",
+            "type": "PLACEMENT",
+        })
+        .to_string()
+    }
+
+    /// A connection to `endpoint`, once it is up, and its subscriptions.
+    fn connect(
+        runtime: &Runtime,
+        endpoint: String,
+    ) -> (
+        ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        Arc<SubscriptionManager>,
+    ) {
+        let interest = Arc::new(InterestTracker::new());
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::new(endpoint, Config::default(), Arc::clone(&interest)).unwrap()
+        };
+        let mut state = connection.state_receiver();
+        within(runtime, "the connection should come up", async {
+            state
+                .wait_for(|state| state.is_connected())
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone(), interest));
+        (connection, subscriptions)
+    }
+
+    /// Subscribes with `subscribe` on a thread of its own while `sub_id`'s place among the active
+    /// subscriptions is held, so the subscribe stops after its request until the venue's answer
+    /// has reached the connection's receivers. Then the venue sends its marker. Returns the
+    /// stream's first message.
+    fn first_after_held_subscribe<S>(
+        runtime: &Runtime,
+        connection: &ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        subscriptions: &Arc<SubscriptionManager>,
+        sub_id: String,
+        marker: &tokio::sync::mpsc::UnboundedSender<()>,
+        subscribe: impl FnOnce(&SubscriptionManager) -> S + Send + 'static,
+    ) -> WsMessage
+    where
+        S: Stream<Item = Result<WsMessage>>,
+    {
+        let mut answers = connection.subscribe();
+        let held = subscriptions.active_subs.entry(sub_id);
+        let (subscribed, is_subscribed) = std::sync::mpsc::channel();
+        let subscriber = {
+            let subscriptions = Arc::clone(subscriptions);
+            thread::spawn(move || {
+                let stream = subscribe(&subscriptions);
+                subscribed.send(()).unwrap();
+                first(stream)
+            })
+        };
+        within(
+            runtime,
+            "the venue should answer the subscribe",
+            answers.recv(),
+        )
+        .unwrap();
+        drop(held);
+        is_subscribed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the subscribe should return");
+        marker.send(()).unwrap();
+        subscriber.join().unwrap()
+    }
+
+    fn runtime() -> Runtime {
+        Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The token's first book, sent while its subscribe is between its request and its receiver,
+    /// is the market stream's first message.
+    #[test]
+    fn a_market_stream_gets_the_answer_to_its_subscribe() {
+        let runtime = runtime();
+        let (endpoint, marker) = runtime.block_on(answering(book("answer"), book("marker")));
+        let (connection, subscriptions) = connect(&runtime, endpoint);
+        let asset = U256::from_str(ASSET).unwrap();
+        let message = first_after_held_subscribe(
+            &runtime,
+            &connection,
+            &subscriptions,
+            format!("market:{asset}"),
+            &marker,
+            move |subscriptions| {
+                subscriptions
+                    .subscribe_market_with_options(vec![asset], false)
+                    .unwrap()
+            },
+        );
+        let WsMessage::Book(book) = message else {
+            panic!("expected a book, got {message:?}");
+        };
+        assert_eq!(
+            book.hash.as_deref(),
+            Some("answer"),
+            "the market stream missed the answer to its subscribe"
+        );
+    }
+
+    /// The venue's first user event, sent while the subscribe is between its request and its
+    /// receiver, is the user stream's first message.
+    #[test]
+    fn a_user_stream_gets_the_answer_to_its_subscribe() {
+        let runtime = runtime();
+        let (endpoint, marker) = runtime.block_on(answering(order("answer"), order("marker")));
+        let (connection, subscriptions) = connect(&runtime, endpoint);
+        let market = B256::from_str(MARKET).unwrap();
+        let credentials = Credentials::new(Uuid::nil(), "secret".to_owned(), "phrase".to_owned());
+        let message = first_after_held_subscribe(
+            &runtime,
+            &connection,
+            &subscriptions,
+            format!("user:{market}"),
+            &marker,
+            move |subscriptions| {
+                subscriptions
+                    .subscribe_user(vec![market], &credentials)
+                    .unwrap()
+            },
+        );
+        let WsMessage::Order(order) = message else {
+            panic!("expected an order, got {message:?}");
+        };
+        assert_eq!(
+            order.id, "answer",
+            "the user stream missed the answer to its subscribe"
+        );
+    }
+
+    type RawStream = Pin<Box<dyn Stream<Item = Result<MarketRawStreamEvent>>>>;
+
+    /// A raw market stream, as V3 reads it, whose venue has closed its first connection: in the
+    /// backoff, one write has gone at once and a second is held after its read of the state. The
+    /// runtime is a current-thread one, run only while a test drives it, so the connection stays
+    /// `Reconnecting` until a test drives it again; the venue answers the second connection's
+    /// handshake once `handshake` is given `()`.
+    struct Backoff {
+        runtime: Runtime,
+        connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        _subscriptions: Arc<SubscriptionManager>,
+        stream: RawStream,
+        handshake: mpsc::UnboundedSender<()>,
+        held: HeldWrite,
+    }
+
+    fn backoff() -> Backoff {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let (endpoint, handshake) = runtime.block_on(gate_the_second());
+        let mut config = Config::default();
+        config.reconnect.initial_backoff = Duration::from_secs(1);
+        config.reconnect.max_backoff = Duration::from_secs(1);
+        let interest = Arc::new(InterestTracker::new());
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::new(endpoint, config, Arc::clone(&interest)).unwrap()
+        };
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone(), interest));
+        let asset = U256::from_str(ASSET).unwrap();
+        let stream: RawStream = Box::pin(
+            subscriptions
+                .subscribe_market_raw_events(vec![asset])
+                .unwrap(),
+        );
+        let mut state = connection.state_receiver();
+        within(&runtime, "connection 1 should go down", async {
+            state
+                .wait_for(|state| matches!(state, ConnectionState::Reconnecting { .. }))
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        connection.send(&"at once").unwrap();
+        let held = {
+            let connection = connection.clone();
+            HeldWrite::start(move || connection.send(&"held").unwrap())
+        };
+        Backoff {
+            runtime,
+            connection,
+            _subscriptions: subscriptions,
+            stream,
+            handshake,
+            held,
+        }
+    }
+
+    async fn connected(diagnostics: &mut broadcast::Receiver<ConnectionDiagnostic>, number: u64) {
+        loop {
+            let diagnostic = diagnostics.recv().await.unwrap();
+            if diagnostic.kind == ConnectionDiagnosticKind::Connected
+                && diagnostic.generation == ConnectionGeneration(number)
+            {
+                return;
+            }
+        }
+    }
+
+    /// The raw stream's `Connected` and `WriteFailed` so far, in order, with their generation.
+    fn connections_and_failed_writes(stream: &mut RawStream) -> Vec<(&'static str, u64)> {
+        let mut seen = Vec::new();
+        while let Some(Some(event)) = stream.next().now_or_never() {
+            if let MarketRawStreamEvent::Continuity { generation, reason } = event.unwrap() {
+                match reason {
+                    MarketStreamContinuity::Connected => seen.push(("connected", generation.0)),
+                    MarketStreamContinuity::WriteFailed => {
+                        seen.push(("write_failed", generation.0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        seen
+    }
+
+    /// The held write goes on once connection 2 is up, its `Connected` out. Both writes failed
+    /// while connection 1 was down.
+    #[test]
+    fn a_write_held_past_the_next_connected_names_the_connection_that_was_down() {
+        let mut backoff = backoff();
+        let mut diagnostics = backoff.connection.subscribe_diagnostics();
+        backoff.handshake.send(()).unwrap();
+        within(
+            &backoff.runtime,
+            "connection 2 should come up",
+            connected(&mut diagnostics, 2),
+        );
+        assert!(backoff.held.release(), "the held write should return");
+        assert_eq!(
+            connections_and_failed_writes(&mut backoff.stream),
+            [
+                ("connected", 1),
+                ("write_failed", 1),
+                ("connected", 2),
+                ("write_failed", 1),
+            ],
+            "the write at once and the held one both failed while connection 1 was down"
+        );
+    }
+
+    /// The held write goes on once connection 2 has published its generation, its `Connected`
+    /// held back: the test borrows the state, which the connection sets to `Connected` next. Both
+    /// writes failed while connection 1 was down.
+    #[test]
+    fn a_write_held_until_the_next_generation_names_the_connection_that_was_down() {
+        let mut backoff = backoff();
+        let mut diagnostics = backoff.connection.subscribe_diagnostics();
+        let mut state = backoff.connection.state_receiver();
+        // The venue holds connection 2's handshake, so the connection stops in `Connecting`.
+        let connecting = within(
+            &backoff.runtime,
+            "connection 2 should be opened",
+            state.wait_for(|state| matches!(state, ConnectionState::Connecting)),
+        )
+        .unwrap();
+        let (published, returned) = thread::scope(|scope| {
+            let Backoff {
+                runtime,
+                connection,
+                handshake,
+                held,
+                ..
+            } = &backoff;
+            let driver = scope.spawn(move || {
+                handshake.send(()).unwrap();
+                within(
+                    runtime,
+                    "connection 2 should come up",
+                    connected(&mut diagnostics, 2),
+                );
+            });
+            let published = wait_until(|| connection.generation() == ConnectionGeneration(2));
+            let returned = published && held.release();
+            drop(connecting);
+            driver.join().unwrap();
+            (published, returned)
+        });
+        assert!(published, "connection 2 should publish its generation");
+        assert!(
+            returned,
+            "the held write should return while `Connected` waits"
+        );
+        assert_eq!(
+            connections_and_failed_writes(&mut backoff.stream),
+            [
+                ("connected", 1),
+                ("write_failed", 1),
+                ("write_failed", 1),
+                ("connected", 2),
+            ],
+            "the write at once and the held one both failed while connection 1 was down"
+        );
     }
 }

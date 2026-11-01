@@ -856,13 +856,20 @@ where
     }
 
     fn emit_reconnect_write_unavailable(&self) {
+        // The generation before the state: the loop publishes a new generation only on a connect,
+        // after `Connecting`, and sets `Reconnecting` only after that connection's end. Read in
+        // this order, the generation is never newer than the connection that was down; read
+        // after, it can be the next one, up by then.
+        let generation = self.generation();
         if matches!(self.state(), ConnectionState::Reconnecting { .. }) {
+            #[cfg(test)]
+            crate::ws::test_support::after_state_read();
             Self::emit_diagnostic(
                 &self.diagnostic_tx,
                 &self.event_tx,
                 &self.raw_event_tx,
                 ConnectionDiagnostic {
-                    generation: self.generation(),
+                    generation,
                     kind: ConnectionDiagnosticKind::WriteFailed,
                 },
             );
