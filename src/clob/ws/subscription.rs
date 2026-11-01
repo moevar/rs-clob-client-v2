@@ -334,9 +334,9 @@ impl SubscriptionManager {
         asset_ids: Vec<U256>,
         custom_features: bool,
     ) -> Result<impl Stream<Item = Result<WsMessage>> + use<>> {
-        let asset_ids_set = self.register_market_subscription(asset_ids, custom_features)?;
-
+        // The receiver before the request, so the stream gets the venue's answer to it.
         let mut rx = self.connection.subscribe();
+        let asset_ids_set = self.register_market_subscription(asset_ids, custom_features)?;
 
         Ok(try_stream! {
             loop {
@@ -557,6 +557,9 @@ impl SubscriptionManager {
             return Err(WsError::ConnectionClosed.into());
         }
 
+        // The receiver before the request, so the stream gets the venue's answer to it.
+        let mut rx = self.connection.subscribe();
+
         self.interest.add(MessageInterest::USER);
 
         // Store auth for re-subscription on reconnect.
@@ -612,9 +615,6 @@ impl SubscriptionManager {
                 created_at: Instant::now(),
             },
         );
-
-        // Create stream for user messages
-        let mut rx = self.connection.subscribe();
 
         Ok(try_stream! {
             loop {

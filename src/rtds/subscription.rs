@@ -184,6 +184,8 @@ impl SubscriptionManager {
         subscription: Subscription,
     ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
         let topic_type = TopicType::new(subscription.topic.clone(), subscription.msg_type.clone());
+        // The receiver before the request, so the stream gets the venue's answer to it.
+        let mut rx = self.connection.subscribe();
 
         // Store auth for re-subscription on reconnect.
         // We can recover from poisoned lock because Option<Credentials> has no inconsistent intermediate state.
@@ -236,8 +238,6 @@ impl SubscriptionManager {
             },
         );
 
-        // Create filtered stream with its own receiver
-        let mut rx = self.connection.subscribe();
         let target_topic = topic_type.topic;
         let target_type = topic_type.msg_type;
 
