@@ -335,9 +335,11 @@ impl SubscriptionManager {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
     use futures::StreamExt as _;
+    use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc;
@@ -346,6 +348,7 @@ mod tests {
 
     use super::*;
     use crate::ws::config::Config;
+    use crate::ws::test_venue::{answering, first, within};
 
     /// An RTDS double: every text frame a client sends but its heartbeat, with the number of the
     /// connection it came on; it closes the first connection after its first request.
@@ -447,6 +450,74 @@ mod tests {
             next(&mut requests),
             (2, subscribe(prices)),
             "the second connection didn't get the subscriptions again first"
+        );
+    }
+
+    /// The topic's first message, sent while its subscribe is between its request and its
+    /// receiver, is the stream's first message. The subscribe is held after its request by its
+    /// place among the active subscriptions, until the answer has reached the connection's
+    /// receivers; then the venue sends its marker.
+    #[test]
+    fn a_stream_gets_the_answer_to_its_subscribe() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let price = |timestamp: i64| {
+            json!({
+                "topic": "crypto_prices",
+                "type": "update",
+                "timestamp": timestamp,
+                "payload": { "symbol": "btcusdt", "timestamp": timestamp, "value": 1 },
+            })
+            .to_string()
+        };
+        let (endpoint, marker) = runtime.block_on(answering(price(1), price(2)));
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::new(endpoint, Config::default(), SimpleParser).unwrap()
+        };
+        let mut state = connection.state_receiver();
+        within(&runtime, "the connection should come up", async {
+            state
+                .wait_for(|state| state.is_connected())
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone()));
+
+        let mut answers = connection.subscribe();
+        let held = subscriptions
+            .active_subs
+            .entry("crypto_prices:update".to_owned());
+        let (subscribed, is_subscribed) = std::sync::mpsc::channel();
+        let subscriber = {
+            let subscriptions = Arc::clone(&subscriptions);
+            thread::spawn(move || {
+                let stream = subscriptions
+                    .subscribe(Subscription::crypto_prices(None))
+                    .unwrap();
+                subscribed.send(()).unwrap();
+                first(stream)
+            })
+        };
+        within(
+            &runtime,
+            "the venue should answer the subscribe",
+            answers.recv(),
+        )
+        .unwrap();
+        drop(held);
+        is_subscribed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the subscribe should return");
+        marker.send(()).unwrap();
+        let message = subscriber.join().unwrap();
+        assert_eq!(
+            message.timestamp, 1,
+            "the stream missed the answer to its subscribe"
         );
     }
 }

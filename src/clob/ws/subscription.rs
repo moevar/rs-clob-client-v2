@@ -788,3 +788,187 @@ impl SubscriptionManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+    use std::thread;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::runtime::{Builder, Runtime};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::ws::config::Config;
+    use crate::ws::test_venue::{answering, first, within};
+
+    const ASSET: &str =
+        "65818619657568813474341868652308942079804919287380422192892211131408793125422";
+    const MARKET: &str = "0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84af";
+
+    fn book(hash: &str) -> String {
+        json!({
+            "event_type": "book",
+            "asset_id": ASSET,
+            "market": MARKET,
+            "bids": [{ "price": ".48", "size": "30" }],
+            "asks": [{ "price": ".52", "size": "25" }],
+            "timestamp": "123456789000",
+            "hash": hash,
+        })
+        .to_string()
+    }
+
+    fn order(id: &str) -> String {
+        json!({
+            "event_type": "order",
+            "id": id,
+            "asset_id": ASSET,
+            "market": MARKET,
+            "owner": "9180014b-33c8-9240-a14b-bdca11c0a465",
+            "original_size": "10",
+            "outcome": "YES",
+            "price": "0.57",
+            "side": "SELL",
+            "size_matched": "0",
+            "status": "LIVE",
+            "timestamp": "1672290687",
+            "type": "PLACEMENT",
+        })
+        .to_string()
+    }
+
+    /// A connection to `endpoint`, once it is up, and its subscriptions.
+    fn connect(
+        runtime: &Runtime,
+        endpoint: String,
+    ) -> (
+        ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        Arc<SubscriptionManager>,
+    ) {
+        let interest = Arc::new(InterestTracker::new());
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::new(endpoint, Config::default(), Arc::clone(&interest)).unwrap()
+        };
+        let mut state = connection.state_receiver();
+        within(runtime, "the connection should come up", async {
+            state
+                .wait_for(|state| state.is_connected())
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        let subscriptions = Arc::new(SubscriptionManager::new(connection.clone(), interest));
+        (connection, subscriptions)
+    }
+
+    /// Subscribes with `subscribe` on a thread of its own while `sub_id`'s place among the active
+    /// subscriptions is held, so the subscribe stops after its request until the venue's answer
+    /// has reached the connection's receivers. Then the venue sends its marker. Returns the
+    /// stream's first message.
+    fn first_after_held_subscribe<S>(
+        runtime: &Runtime,
+        connection: &ConnectionManager<WsMessage, Arc<InterestTracker>>,
+        subscriptions: &Arc<SubscriptionManager>,
+        sub_id: String,
+        marker: &tokio::sync::mpsc::UnboundedSender<()>,
+        subscribe: impl FnOnce(&SubscriptionManager) -> S + Send + 'static,
+    ) -> WsMessage
+    where
+        S: Stream<Item = Result<WsMessage>>,
+    {
+        let mut answers = connection.subscribe();
+        let held = subscriptions.active_subs.entry(sub_id);
+        let (subscribed, is_subscribed) = std::sync::mpsc::channel();
+        let subscriber = {
+            let subscriptions = Arc::clone(subscriptions);
+            thread::spawn(move || {
+                let stream = subscribe(&subscriptions);
+                subscribed.send(()).unwrap();
+                first(stream)
+            })
+        };
+        within(
+            runtime,
+            "the venue should answer the subscribe",
+            answers.recv(),
+        )
+        .unwrap();
+        drop(held);
+        is_subscribed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the subscribe should return");
+        marker.send(()).unwrap();
+        subscriber.join().unwrap()
+    }
+
+    fn runtime() -> Runtime {
+        Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The token's first book, sent while its subscribe is between its request and its receiver,
+    /// is the market stream's first message.
+    #[test]
+    fn a_market_stream_gets_the_answer_to_its_subscribe() {
+        let runtime = runtime();
+        let (endpoint, marker) = runtime.block_on(answering(book("answer"), book("marker")));
+        let (connection, subscriptions) = connect(&runtime, endpoint);
+        let asset = U256::from_str(ASSET).unwrap();
+        let message = first_after_held_subscribe(
+            &runtime,
+            &connection,
+            &subscriptions,
+            format!("market:{asset}"),
+            &marker,
+            move |subscriptions| {
+                subscriptions
+                    .subscribe_market_with_options(vec![asset], false)
+                    .unwrap()
+            },
+        );
+        let WsMessage::Book(book) = message else {
+            panic!("expected a book, got {message:?}");
+        };
+        assert_eq!(
+            book.hash.as_deref(),
+            Some("answer"),
+            "the market stream missed the answer to its subscribe"
+        );
+    }
+
+    /// The venue's first user event, sent while the subscribe is between its request and its
+    /// receiver, is the user stream's first message.
+    #[test]
+    fn a_user_stream_gets_the_answer_to_its_subscribe() {
+        let runtime = runtime();
+        let (endpoint, marker) = runtime.block_on(answering(order("answer"), order("marker")));
+        let (connection, subscriptions) = connect(&runtime, endpoint);
+        let market = B256::from_str(MARKET).unwrap();
+        let credentials = Credentials::new(Uuid::nil(), "secret".to_owned(), "phrase".to_owned());
+        let message = first_after_held_subscribe(
+            &runtime,
+            &connection,
+            &subscriptions,
+            format!("user:{market}"),
+            &marker,
+            move |subscriptions| {
+                subscriptions
+                    .subscribe_user(vec![market], &credentials)
+                    .unwrap()
+            },
+        );
+        let WsMessage::Order(order) = message else {
+            panic!("expected an order, got {message:?}");
+        };
+        assert_eq!(
+            order.id, "answer",
+            "the user stream missed the answer to its subscribe"
+        );
+    }
+}
