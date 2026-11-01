@@ -857,6 +857,8 @@ where
 
     fn emit_reconnect_write_unavailable(&self) {
         if matches!(self.state(), ConnectionState::Reconnecting { .. }) {
+            #[cfg(test)]
+            tests::after_state_read();
             Self::emit_diagnostic(
                 &self.diagnostic_tx,
                 &self.event_tx,
@@ -1024,9 +1026,112 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::thread;
+
+    use serde_json::Value;
+    use tokio::runtime::Builder;
 
     use super::*;
+    use crate::ws::test_venue::{close_the_first, within};
+
+    thread_local! {
+        /// A writer's pause between its read of the state and its diagnostic, set by a test.
+        static AFTER_STATE_READ: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_state_read() {
+        AFTER_STATE_READ.with_borrow_mut(|pause| {
+            if let Some(pause) = pause {
+                pause();
+            }
+        });
+    }
+
+    #[derive(Clone)]
+    struct JsonParser;
+
+    impl MessageParser<Value> for JsonParser {
+        fn parse(&self, bytes: &[u8]) -> Result<Vec<Value>> {
+            Ok(vec![serde_json::from_slice(bytes)?])
+        }
+    }
+
+    /// Two writes while connection 1 is down, in its backoff: one at once, one held between its
+    /// read of the state and its report until connection 2 is up. Both failed while 1 was down.
+    #[test]
+    fn a_write_failed_while_reconnecting_names_the_connection_that_was_down() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = runtime.block_on(close_the_first());
+        let mut config = Config::default();
+        // A backoff of 1 to 3 s (its randomization) keeps `Reconnecting` while the writers read.
+        config.reconnect.initial_backoff = Duration::from_secs(2);
+        config.reconnect.max_backoff = Duration::from_secs(2);
+        let connection = {
+            let _entered = runtime.enter();
+            ConnectionManager::<Value, _>::new(endpoint, config, JsonParser).unwrap()
+        };
+        let mut diagnostics = connection.subscribe_diagnostics();
+        let mut state = connection.state_receiver();
+        within(&runtime, "connection 1 should go down", async {
+            state
+                .wait_for(|state| matches!(state, ConnectionState::Reconnecting { .. }))
+                .await
+                .map(drop)
+                .unwrap();
+        });
+        assert_eq!(connection.generation(), ConnectionGeneration(1));
+
+        connection.send(&"at once").unwrap();
+        let (paused, is_paused) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel::<()>();
+        let held = {
+            let connection = connection.clone();
+            thread::spawn(move || {
+                AFTER_STATE_READ.set(Some(Box::new(move || {
+                    paused.send(()).unwrap();
+                    resumed.recv().unwrap();
+                })));
+                connection.send(&"held").unwrap();
+            })
+        };
+        is_paused
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the held writer should read `Reconnecting`");
+
+        let mut seen = Vec::new();
+        within(&runtime, "connection 2 should come up", async {
+            loop {
+                let diagnostic = diagnostics.recv().await.unwrap();
+                let up = diagnostic.kind == ConnectionDiagnosticKind::Connected
+                    && diagnostic.generation == ConnectionGeneration(2);
+                seen.push(diagnostic);
+                if up {
+                    break;
+                }
+            }
+        });
+        resume.send(()).unwrap();
+        held.join().unwrap();
+        while let Ok(diagnostic) = diagnostics.try_recv() {
+            seen.push(diagnostic);
+        }
+
+        let failed: Vec<u64> = seen
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == ConnectionDiagnosticKind::WriteFailed)
+            .map(|diagnostic| diagnostic.generation.0)
+            .collect();
+        assert_eq!(
+            failed,
+            [1, 1],
+            "the write at once, then the held one, both failed while connection 1 was down"
+        );
+    }
 
     #[test]
     fn raw_frame_builder_runs_only_when_raw_observers_exist() {

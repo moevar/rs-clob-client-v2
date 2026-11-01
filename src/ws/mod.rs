@@ -23,6 +23,8 @@ pub mod config;
 pub mod connection;
 pub mod error;
 pub mod raw_event;
+#[cfg(test)]
+pub(crate) mod test_venue;
 pub mod traits;
 
 pub use connection::{
